@@ -1,0 +1,37 @@
+name: AC500 Hybrid beta checks
+on:
+  push:
+    branches: ["feature/ac500-hybrid-beta1", "main"]
+    paths:
+      - "bluetti2mqtt_ac500_hybrid/**"
+      - ".github/workflows/ac500-hybrid.yml"
+  pull_request:
+    paths:
+      - "bluetti2mqtt_ac500_hybrid/**"
+      - ".github/workflows/ac500-hybrid.yml"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python syntax
+        run: python -m compileall -q bluetti2mqtt_ac500_hybrid/rootfs/app
+      - name: Validate add-on config
+        run: |
+          python -m pip install 'PyYAML>=6,<7'
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+          d=yaml.safe_load(Path("bluetti2mqtt_ac500_hybrid/config.yaml").read_text())
+          assert d["slug"] == "bluetti2mqtt_ac500_hybrid"
+          assert d["version"] == "1.0.0-beta1"
+          assert d["options"]["modbus_port"] == 502
+          assert d["options"]["modbus_poll_sec"] >= 2
+          assert d["options"]["poll_sec"] >= 15
+          print("Hybrid add-on config is valid YAML")
+          PY
+      - name: Modbus TCP fake-server tests
+        run: python -m unittest discover -v -s bluetti2mqtt_ac500_hybrid/tests
