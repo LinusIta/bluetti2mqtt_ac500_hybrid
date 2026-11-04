@@ -228,6 +228,7 @@ class OneWriteReader(DeviceReader):
         self.new_value = new_value
         self.response_ok = False
         self.previous_value = None
+        self.verified_value = None
 
     async def _async_send_command(self, register):
         original = await super()._async_send_command(register)
@@ -237,13 +238,25 @@ class OneWriteReader(DeviceReader):
         self.previous_value = int.from_bytes(raw, "big")
         if self.previous_value == self.new_value:
             self.response_ok = True
+            self.verified_value = self.previous_value
             return original
         write = WriteableRegister(self.address, self.new_value)
         reply = await super()._async_send_command(write)
         self.response_ok = bytes(reply) == bytes(write)
         if not self.response_ok:
             raise RuntimeError("FC06 echo mismatch or missing (write outcome unknown)")
-        return original  # Delayed updates are verified by later polling.
+        # Try a cheap FC03 read-back in this SAME authenticated session.
+        # A delayed device write may still return the old value; do not claim
+        # it succeeded unless the register actually reports the target value.
+        try:
+            verify_register = ReadableRegisters(self.address, 1)
+            verified = await super()._async_send_command(verify_register)
+            data = verify_register.parse_response(verified)
+            if len(data) == 2:
+                self.verified_value = int.from_bytes(data, "big")
+        except Exception as exc:
+            LOG.warning("FC06 read-back unavailable for register %d: %s", self.address, exc)
+        return original
 
 # AC500 B300 pack selector and data block, verified against the actual AC500.
 # 3006: selected slot; 96: reported slot; 98: voltage in centivolts;
@@ -254,6 +267,10 @@ PACK_COUNT = 37
 PACK_CELL_ADDRESSES = range(105, 121)
 PACK_SETTLE_SECONDS = 10
 
+class PackScanPreempted(Exception):
+    """A queued MQTT command interrupted a noncritical B300 scan."""
+
+
 class PackPollingReader(DeviceReader):
     """Scan selected B300 slots over ONE encrypted BLE session.
 
@@ -263,9 +280,10 @@ class PackPollingReader(DeviceReader):
     energy configuration writes.  The selector is restored in finally.
     """
 
-    def __init__(self, *args, targets: list[int], **kwargs):
+    def __init__(self, *args, targets: list[int], priority_event: asyncio.Event, **kwargs):
         super().__init__(*args, **kwargs)
         self.targets = list(targets)
+        self.priority_event = priority_event
         self.packs: dict[int, dict[str, Any]] = {}
         self.empty_slots: set[int] = set()
         self.failed_slots: set[int] = set()
@@ -288,6 +306,8 @@ class PackPollingReader(DeviceReader):
         try:
             for slot in self.targets:
                 try:
+                    if self.priority_event.is_set():
+                        raise PackScanPreempted()
                     if active_slot != slot:
                         selector_write = WriteableRegister(PACK_SELECTOR, slot)
                         echo = await super()._async_send_command(selector_write)
@@ -296,7 +316,11 @@ class PackPollingReader(DeviceReader):
                         active_slot = slot
 
                     # Device refreshes the multiplexed BMS block asynchronously.
-                    await asyncio.sleep(PACK_SETTLE_SECONDS)
+                    try:
+                        await asyncio.wait_for(self.priority_event.wait(), timeout=PACK_SETTLE_SECONDS)
+                        raise PackScanPreempted()
+                    except asyncio.TimeoutError:
+                        pass
                     request = ReadableRegisters(PACK_START, PACK_COUNT)
                     response = await super()._async_send_command(request)
                     block = request.parse_response(response)
@@ -327,6 +351,9 @@ class PackPollingReader(DeviceReader):
                         "voltages": voltages,
                     }
                     LOG.info("B300 slot %d: %.2f V, %d%%, 16 cells", slot, pack_voltage, percent)
+                except PackScanPreempted:
+                    LOG.info("B300 slot %d paused to prioritize MQTT command", slot)
+                    raise
                 except Exception as exc:
                     self.failed_slots.add(slot)
                     LOG.warning("B300 slot %d scan failed: %s", slot, exc)
@@ -352,7 +379,7 @@ class Bridge:
         self.opts = opts
         self.device = AC500()
         self.device.max_packs = 0  # preview: disable battery pack selector writes
-        self.queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self.queue: asyncio.Queue[tuple[str, str, float]] = asyncio.Queue()
         self.pending_write = asyncio.Event()
         self.crypto_faults = 0
         self.loop = asyncio.get_running_loop()
@@ -408,7 +435,7 @@ class Bridge:
         # Called on the asyncio loop: flag work before either BLE loop can
         # begin another session.  Do not drop or coalesce user writes.
         self.pending_write.set()
-        self.queue.put_nowait((field, value))
+        self.queue.put_nowait((field, value, time.monotonic()))
 
     async def wait_for_pending_writes(self):
         # Between battery probes, give the command worker first access to BLE.
@@ -528,6 +555,7 @@ class Bridge:
         absent: set[int] = set()
         failures: set[int] = set()
         restore_failures: set[int] = set()
+        interrupted = False
 
         # Crucial dev8 change: one handshake/read/selector/restore/disconnect
         # per pack. Dev7 held a single encrypted BLE session across all six
@@ -538,7 +566,7 @@ class Bridge:
             # A newly queued write can arrive between checking the queue and
             # acquiring the session lock.  Recheck under the lock, release it
             # and let the command worker proceed before this B300 probe.
-            reader = self.new_reader(PackPollingReader, targets=[slot])
+            reader = self.new_reader(PackPollingReader, targets=[slot], priority_event=self.pending_write)
             try:
                 while not self.stop_event.is_set():
                     await self.wait_for_pending_writes()
@@ -567,6 +595,11 @@ class Bridge:
                     restore_failures.add(slot)
                 if slot not in reader.packs and slot not in reader.empty_slots:
                     failures.add(slot)
+            except PackScanPreempted:
+                interrupted = True
+                # Revisit the slot on the next scan, rather than publishing
+                # a false failure or marking the full scan complete.
+                break
             except Exception as exc:
                 failures.add(slot)
                 LOG.warning("B300 slot %d isolated session failed: %s", slot, exc)
@@ -578,7 +611,8 @@ class Bridge:
         if full_scan:
             # Only validated zero-voltage responses mark an empty slot.
             self.active_pack_slots.difference_update(absent)
-            self.last_full_pack_scan = time.monotonic()
+            if not interrupted:
+                self.last_full_pack_scan = time.monotonic()
         self.active_pack_slots.update(present)
         for slot, details in present.items():
             self.publish_pack_discovery(slot)
@@ -754,6 +788,7 @@ class Bridge:
             LOG.error("Rejected command %r=%r: %s", field, payload, ex)
             return
         LOG.info("FC06 %s register=%d value=%d", field, address, value)
+        started = time.monotonic()
         reader = self.new_reader(OneWriteReader, address=address, new_value=value)
         async with self.ble_session_lock:
             try:
@@ -763,14 +798,25 @@ class Bridge:
         if result is None or not reader.response_ok:
             LOG.error("Write unconfirmed: %s=%s", field, payload)
             return
-        LOG.info("FC06 accepted: %s=%s; requesting immediate BLE read-back", field, payload)
-        self.refresh_requested.set()
-        # Do not optimistically publish payload: actual hardware state is read back over BLE.
+        if reader.verified_value == value:
+            self.last_registers[address] = value
+            # This has been read back from hardware, not optimistically
+            # mirrored from the MQTT command.
+            self.publish(field, value)
+            LOG.info("FC06 verified: %s=%s (%.1fs from writer start)",
+                     field, payload, time.monotonic() - started)
+        else:
+            LOG.warning("FC06 accepted but not yet verified: %s=%s, read-back=%s",
+                        field, payload, reader.verified_value)
+            self.refresh_requested.set()
+        # Only schedule a full BLE refresh when a direct read-back is inconclusive.
 
     async def worker(self):
         while not self.stop_event.is_set():
-            field, payload = await self.queue.get()
+            field, payload, received_at = await self.queue.get()
             try:
+                LOG.info("MQTT command %s dispatched after %.2fs in queue",
+                         field, time.monotonic() - received_at)
                 await self.handle_write(field, payload)
             except Exception:
                 LOG.exception("Command failed: %s", field)

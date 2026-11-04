@@ -2,7 +2,7 @@
 
 Independent Home Assistant add-on repository for **Bluetti AC500 Hybrid (Modbus TCP + encrypted BLE)**.
 
-**Current version:** `1.0.0-beta1` (experimental; device validation pending).
+**Current version:** `1.0.0-beta2` (experimental; device validation pending).
 
 The add-on lives in [`bluetti2mqtt_ac500_hybrid/`](bluetti2mqtt_ac500_hybrid/README.md) and can be installed from the Home Assistant add-on store using this repository URL:
 
