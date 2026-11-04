@@ -1,4 +1,4 @@
-# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta1)
+# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta2)
 
 **Experimental third Home Assistant add-on**, independent of:
 - Bluetti2MQTT Plus 3.0.3 (legacy);
@@ -54,3 +54,9 @@ guarantee is possible while the BLE session is busy.
   are safe for writing.
 - The first BLE cold poll may occur before the first Modbus success. MQTT
   consumers must rely on their own staleness checks in case both transports fail.
+
+## v1.0.0-beta2 — MQTT command priority
+- Abort B300's noncritical 10-second settle wait when an MQTT command arrives; restore B300 selector before releasing the BLE session.
+- FC06 write echo followed by FC03 read-back **within the same encrypted connection**; publish the actual read-back state only if verified.
+- Command queue dispatch latency logged; unsuccessful read-back triggers a prompt full BLE recheck.
+- Modbus telemetry and normal BLE/B300 scheduling unchanged.
