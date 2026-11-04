@@ -284,6 +284,7 @@ class PackPollingReader(DeviceReader):
         super().__init__(*args, **kwargs)
         self.targets = list(targets)
         self.priority_event = priority_event
+        self.was_preempted = False
         self.packs: dict[int, dict[str, Any]] = {}
         self.empty_slots: set[int] = set()
         self.failed_slots: set[int] = set()
@@ -352,6 +353,7 @@ class PackPollingReader(DeviceReader):
                     }
                     LOG.info("B300 slot %d: %.2f V, %d%%, 16 cells", slot, pack_voltage, percent)
                 except PackScanPreempted:
+                    self.was_preempted = True
                     LOG.info("B300 slot %d paused to prioritize MQTT command", slot)
                     raise
                 except Exception as exc:
@@ -581,6 +583,9 @@ class Bridge:
                                 await reader.read(
                                     only_registers=[ReadableRegisters(PACK_SELECTOR, 1)],
                                     raw=True)
+                                if reader.was_preempted:
+                                    # DeviceReader can swallow callback exceptions.
+                                    raise PackScanPreempted()
                             finally:
                                 # Protect the next encrypted handshake.
                                 await asyncio.sleep(2)
