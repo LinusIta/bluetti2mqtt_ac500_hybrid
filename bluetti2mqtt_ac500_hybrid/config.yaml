@@ -3,7 +3,7 @@ version: "1.0.0-beta1"
 stage: experimental
 slug: bluetti2mqtt_ac500_hybrid
 description: "AC500 Modbus TCP telemetry + encrypted BLE packs and commands (beta)"
-url: https://github.com/LinusIta/bluetti2mqtt_plus
+url: https://github.com/LinusIta/bluetti2mqtt_ac500_hybrid
 arch:
   - aarch64
   - amd64
