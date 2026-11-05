@@ -1,5 +1,5 @@
 name: "Bluetti2MQTT Plus - AC500 Hybrid"
-version: "1.0.0-beta8"
+version: "1.0.0-beta9"
 stage: experimental
 slug: bluetti2mqtt_ac500_hybrid
 description: "AC500 Modbus TCP telemetry + encrypted BLE packs and commands (beta)"
@@ -26,6 +26,7 @@ options:
   poll_sec: 120
   pack_poll_sec: 600
   pack_scan_sec: 3600
+  pack_poll_enabled: false
   ha_config: normal
   allow_writes: false
   debug: false
@@ -42,6 +43,7 @@ schema:
   poll_sec: int
   pack_poll_sec: int
   pack_scan_sec: int
+  pack_poll_enabled: bool
   ha_config: list(normal|none|advanced)
   allow_writes: bool
   debug: bool
