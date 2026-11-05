@@ -82,6 +82,7 @@ def load_reader():
     klass.SESSION_SECONDS = 2.05
     klass.VERIFY_DELAY = 0.11
     klass.VERIFY_RETRY = 0.05
+    klass.VERIFIED_IDLE_SECONDS = 0.12
     return klass
 
 
@@ -99,6 +100,48 @@ class TestChargeSession(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("grid_charge_amps", 4), bridge.states)
         self.assertEqual(reader.verified, 1)
         self.assertEqual(bridge.commands.verified[3019][0], 4)
+
+    async def test_closes_early_after_verified_state(self):
+        bridge = FakeBridge()
+        bridge.commands.put(3019, "grid_charge_amps", "4", 4, time.monotonic())
+        bridge.commands.pop(time.monotonic())
+        reader = ChargeSessionReader(bridge=bridge, first_field="grid_charge_amps", first_value=4)
+        started = time.monotonic()
+        await reader._async_send_command(ReadableRegisters(3019, 1))
+        elapsed = time.monotonic() - started
+        self.assertEqual(reader.writes, [4])
+        self.assertEqual(reader.verified, 1)
+        self.assertLess(elapsed, 0.55, "should not remain open until session timeout")
+        self.assertGreaterEqual(elapsed, 0.23, "must leave a short reuse window")
+
+    async def test_reuses_session_for_setpoint_after_first_verification(self):
+        bridge = FakeBridge()
+        bridge.commands.put(3019, "grid_charge_amps", "4", 4, time.monotonic())
+        bridge.commands.pop(time.monotonic())
+        reader = ChargeSessionReader(bridge=bridge, first_field="grid_charge_amps", first_value=4)
+
+        async def new_target_after_verification():
+            await asyncio.sleep(0.14)
+            bridge.commands.put(3019, "grid_charge_amps", "3", 3, time.monotonic())
+
+        await asyncio.gather(reader._async_send_command(ReadableRegisters(3019, 1)),
+                             new_target_after_verification())
+        self.assertEqual(reader.writes, [4, 3])
+        self.assertEqual(bridge.commands.verified[3019][0], 3)
+
+    async def test_reverting_setpoint_during_pending_fc06_is_not_lost(self):
+        bridge = FakeBridge()
+        bridge.commands.put(3019, "grid_charge_amps", "4", 4, time.monotonic())
+        bridge.commands.pop(time.monotonic())
+        reader = ChargeSessionReader(bridge=bridge, first_field="grid_charge_amps", first_value=4)
+
+        async def revert():
+            await asyncio.sleep(0.055)
+            bridge.commands.put(3019, "grid_charge_amps", "5", 5, time.monotonic())
+
+        await asyncio.gather(reader._async_send_command(ReadableRegisters(3019, 1)), revert())
+        self.assertEqual(reader.writes, [4, 5])
+        self.assertEqual(bridge.commands.verified[3019][0], 5)
 
     async def test_newer_target_reuses_session_without_handshake(self):
         bridge = FakeBridge()
