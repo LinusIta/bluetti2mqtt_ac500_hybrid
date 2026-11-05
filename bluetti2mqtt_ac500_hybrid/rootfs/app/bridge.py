@@ -280,6 +280,144 @@ class PackScanPreempted(Exception):
     """A queued MQTT command interrupted a noncritical B300 scan."""
 
 
+class ChargeSessionReader(DeviceReader):
+    """AC500 3019: reuse ONE encrypted session for rapid surplus updates.
+
+    Hardware tested: repeated FC03 + FC06 on the same encrypted connection.
+    End the session before the observed ~25s disconnect threshold. This class
+    owns only register 3019; other controls keep the proven beta5 path.
+    """
+
+    SESSION_SECONDS = 18.0
+    VERIFY_DELAY = 3.4
+    VERIFY_RETRY = 1.0
+
+    def __init__(self, *args, bridge, first_field, first_value, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bridge = bridge
+        self.first_field = first_field
+        self.first_value = first_value
+        self.write_count = 0
+        self.verified = 0
+        self.first_ack = False
+
+    async def _read_amps(self):
+        reg = ReadableRegisters(3019, 1)
+        reply = await super()._async_send_command(reg)
+        body = reg.parse_response(reply)
+        if len(body) != 2:
+            raise RuntimeError("AC500 FC03 3019 returned no value")
+        return int.from_bytes(body, "big")
+
+    async def _async_send_command(self, register):
+        # DeviceReader.read() already performed the ECDSA handshake, started
+        # BLE notifications and will disconnect/reset keys after this returns.
+        started = time.monotonic()
+        deadline = started + self.SESSION_SECONDS
+        initial_reply = await super()._async_send_command(register)
+        initial_body = register.parse_response(initial_reply)
+        if len(initial_body) != 2:
+            raise RuntimeError("AC500 initial 3019 read failed")
+        observed = int.from_bytes(initial_body, "big")
+        self.bridge.last_registers[3019] = observed
+        self.bridge.publish("grid_charge_amps", observed)
+        self.bridge.commands.mark_verified(3019, observed, time.monotonic())
+        field = self.first_field
+        target = self.first_value
+        verify_due = None
+
+        async def issue_setpoint(new_field, new_value):
+            nonlocal observed, field, target, verify_due
+            field, target = new_field, new_value
+            # A read result is actual hardware evidence; never publish an
+            # optimistic MQTT state on FC06 echo alone.
+            if observed == target:
+                self.bridge.commands.mark_verified(3019, target, time.monotonic())
+                self.bridge.publish("grid_charge_amps", target)
+                LOG.info("BLE session 3019 already at %d A", target)
+                verify_due = None
+                return
+            write = WriteableRegister(3019, target)
+            echo = await super(ChargeSessionReader, self)._async_send_command(write)
+            if bytes(echo) != bytes(write):
+                raise RuntimeError("AC500 FC06 echo missing/mismatched (outcome uncertain)")
+            self.write_count += 1
+            self.first_ack = True
+            # Any prior hardware sample is now stale until the new target is
+            # observed. Never deduplicate based on a pre-FC06 value.
+            self.bridge.commands.verified.pop(3019, None)
+            verify_due = time.monotonic() + self.VERIFY_DELAY
+            LOG.info("BLE session FC06 ACK: grid_charge_amps=%d A; "
+                     "read-back scheduled (%.2fs into session)",
+                     target, time.monotonic() - started)
+
+        await issue_setpoint(field, target)
+        LOG.info("BLE fast session ready: duration limit %.0fs, register 3019",
+                 self.SESSION_SECONDS)
+
+        while not self.bridge.stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            # Leave time for cleanup before the observed BLE disconnection.
+            if remaining <= 1.5 or not self.client or not self.client.is_connected:
+                break
+
+            # Other control registers (SOC, UPS, etc.) take priority over
+            # keeping the 3019 session alive. Never consume their commands.
+            if any(address != 3019 for address in self.bridge.commands.pending):
+                LOG.info("BLE fast session yielding to another control register")
+                break
+
+            if 3019 in self.bridge.commands.pending:
+                # The mailbox already collapsed rapid changes to the latest
+                # desired value. Keep active bookkeeping aligned with the
+                # command actually being executed.
+                self.bridge.commands.finish(3019, target)
+                next_command = self.bridge.commands.pop(time.monotonic())
+                if next_command:
+                    _, new_field, payload, new_value, received_at = next_command
+                    LOG.info("MQTT grid_charge_amps=%d reused encrypted BLE "
+                             "session after %.2fs queued",
+                             new_value, time.monotonic() - received_at)
+                    if new_value != target:
+                        await issue_setpoint(new_field, new_value)
+                    else:
+                        # Identical fresh request: the existing FC06 ACK still
+                        # needs a real hardware read-back, not a second FC06.
+                        field = new_field
+                continue
+
+            if verify_due is not None and time.monotonic() >= verify_due:
+                # Read-back costs ~0.1s in a live encrypted session. It also
+                # updates the HA number promptly, unlike a new 10s handshake.
+                observed = await self._read_amps()
+                self.bridge.last_registers[3019] = observed
+                self.bridge.publish("grid_charge_amps", observed)
+                if observed == target:
+                    self.bridge.commands.mark_verified(3019, observed, time.monotonic())
+                LOG.info("BLE fast session hardware grid_charge_amps=%d A "
+                         "(requested=%d A, +%.1fs)", observed, target,
+                         time.monotonic() - started)
+                if observed == target:
+                    self.verified += 1
+                    verify_due = None
+                else:
+                    verify_due = time.monotonic() + self.VERIFY_RETRY
+                continue
+
+            await asyncio.sleep(min(0.15, max(0.01, remaining - 1.5)))
+
+        LOG.info("BLE fast session complete: %.1fs, writes=%d, verified=%d, "
+                 "last_target=%d, last_observed=%d",
+                 time.monotonic() - started, self.write_count, self.verified,
+                 target, observed)
+        # A normal poll can resolve a late hardware application. Do not retry
+        # FC06 automatically because a newer command might already supersede it.
+        if verify_due is not None:
+            self.bridge.refresh_requested.set()
+        self.bridge.commands.finish(3019, target)
+        return initial_reply
+
+
 class PackPollingReader(DeviceReader):
     """Scan selected B300 slots over ONE encrypted BLE session.
 
@@ -823,6 +961,20 @@ class Bridge:
             LOG.error("Rejected command %r=%r: %s", field, payload, ex)
             return
         LOG.info("FC06 %s register=%d value=%d", field, address, value)
+        if address == 3019:
+            # Experimental fast path: one ECDSA handshake, many commands and
+            # read-backs. Other registers retain the beta5 isolated writer.
+            reader = self.new_reader(ChargeSessionReader, bridge=self,
+                                     first_field=field, first_value=value)
+            async with self.ble_session_lock:
+                try:
+                    outcome = await reader.read(
+                        only_registers=[ReadableRegisters(3019, 1)], raw=True)
+                finally:
+                    await asyncio.sleep(2)
+            if outcome is None:
+                LOG.error("BLE fast session failed; do not replay uncertain FC06")
+            return
         started = time.monotonic()
         reader = self.new_reader(OneWriteReader, address=address, new_value=value,
                                  newer_command_waiting=lambda: self.commands.has_pending)
