@@ -17,6 +17,9 @@ MAP = {
     50269: [45, 102],
     50273: [67],
     51002: [526, 20, 32],
+    57001: [1],
+    57005: [0],
+    57016: [20, 100],
 }
 
 
@@ -64,7 +67,11 @@ class TestAC500Modbus(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["dc_input_power2"], 67)
         self.assertEqual(result["dc_input_power"], 112)
         self.assertEqual(result["ac_output_power"], 123)
-        self.assertEqual(len(self.requests), 7)
+        self.assertEqual(result["battery_range_start"], 20)
+        self.assertEqual(result["battery_range_end"], 100)
+        self.assertEqual(result["ac_output_on"], "ON")
+        self.assertEqual(result["dc_output_on"], "OFF")
+        self.assertEqual(len(self.requests), 10)
 
     async def test_exception_is_not_a_valid_measurement(self):
         with self.assertRaisesRegex(ValueError, "exception code 2"):
@@ -74,7 +81,7 @@ class TestAC500Modbus(unittest.IsolatedAsyncioTestCase):
         first = await self.client.read_fields()
         second = await self.client.read_fields()
         self.assertEqual(first, second)
-        self.assertEqual(len(self.requests), 14)
+        self.assertEqual(len(self.requests), 20)
 
 
 if __name__ == "__main__":
