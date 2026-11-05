@@ -783,7 +783,7 @@ class Bridge:
 
                 # bluetti-bt-lib swallows callback exceptions and can return
                 # None even when our reader marked itself as preempted.
-                if reader.was_preempted or self.pending_write.is_set():
+                if reader.was_preempted:
                     LOG.info("B300 slot %d preempted for MQTT; preserving previous samples", slot)
                     break
 
