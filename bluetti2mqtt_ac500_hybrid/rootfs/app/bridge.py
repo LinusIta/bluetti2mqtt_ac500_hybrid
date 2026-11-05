@@ -350,6 +350,9 @@ class ChargeSessionReader(DeviceReader):
             # Any prior hardware sample is now stale until the new target is
             # observed. Never deduplicate based on a pre-FC06 value.
             self.bridge.commands.verified.pop(3019, None)
+            # The last FC03 sample predates FC06. It is NOT reliable evidence
+            # for deduplicating a subsequent setpoint until we read again.
+            observed = None
             verify_due = time.monotonic() + self.VERIFY_DELAY
             LOG.info("BLE session FC06 ACK: grid_charge_amps=%d A; "
                      "read-back scheduled (%.2fs into session)",
@@ -421,7 +424,7 @@ class ChargeSessionReader(DeviceReader):
             await asyncio.sleep(min(0.15, max(0.01, remaining - 1.0)))
 
         LOG.info("BLE fast session complete: %.1fs, writes=%d, verified=%d, "
-                 "last_target=%d, last_observed=%d",
+                 "last_target=%d, last_observed=%s",
                  time.monotonic() - started, self.write_count, self.verified,
                  target, observed)
         # A normal poll can resolve a late hardware application. Do not retry
