@@ -249,30 +249,22 @@ class OneWriteReader(DeviceReader):
         self.response_ok = bytes(reply) == bytes(write)
         if not self.response_ok:
             raise RuntimeError("FC06 echo mismatch or missing (write outcome unknown)")
-        # AC500 can acknowledge FC06 before the new value becomes visible in
-        # FC03. Verify up to three times in this *same* BLE session, without
-        # issuing another write. Do not delay a newer queued MQTT command.
-        for attempt, pause in enumerate((0.0, 0.75, 1.5), start=1):
-            if self.newer_command_waiting():
-                self.readback_superseded = True
-                break
-            if pause:
-                await asyncio.sleep(pause)
-                if self.newer_command_waiting():
-                    self.readback_superseded = True
-                    break
+        # AC500 often reports the *previous* value directly after FC06.
+        # Make at most ONE immediate FC03 verification (no delay loops).
+        # Any delayed update is reconciled by a scheduled normal BLE poll,
+        # so this session can disconnect and release newer surplus commands.
+        if self.newer_command_waiting():
+            self.readback_superseded = True
+        else:
             try:
                 verify_register = ReadableRegisters(self.address, 1)
                 verified = await super()._async_send_command(verify_register)
                 data = verify_register.parse_response(verified)
-                self.readback_attempts += 1
+                self.readback_attempts = 1
                 if len(data) == 2:
                     self.verified_value = int.from_bytes(data, "big")
-                    if self.verified_value == self.new_value:
-                        break
             except Exception as exc:
                 LOG.warning("FC06 read-back unavailable for register %d: %s", self.address, exc)
-                break
         return original
 
 # AC500 B300 pack selector and data block, verified against the actual AC500.
@@ -724,6 +716,15 @@ class Bridge:
                 await asyncio.sleep(2)
         if not raw:
             raise RuntimeError("BLE poll returned no registers")
+        # Log the actual hardware readback, not the last MQTT setpoint. The
+        # user's surplus controller depends on timely, truthful state updates.
+        actual_amps = legacy_register_value(raw, 3019)
+        if actual_amps is not None:
+            self.last_registers[3019] = actual_amps
+            self.commands.mark_verified(3019, actual_amps, time.monotonic())
+            LOG.info("BLE hardware grid_charge_amps=%d A (register 3019)", actual_amps)
+        else:
+            LOG.warning("BLE poll did not return register 3019; cannot verify charge amps")
         parsed: dict[str, Any] = {}
         for address, body in raw.items():
             try:
