@@ -1156,6 +1156,29 @@ class Bridge:
                 if not self.commands.has_pending:
                     self.pending_write.clear()
 
+    def reconcile_soc_tcp(self, data, sample_at):
+        """Confirm pending SOC FC06 only from a post-ACK hardware TCP read.
+
+        Never use the MQTT target, FC06 echo or a cached pre-ACK sample as proof.
+        """
+        for addr, field in ((3015, "battery_range_start"),
+                            (3016, "battery_range_end")):
+            pending = self.soc_tcp_pending.get(addr)
+            if pending is None:
+                continue
+            target, ack_at = pending
+            actual = data.get(field)
+            if actual == target and sample_at >= ack_at:
+                self.commands.mark_verified(addr, actual, sample_at)
+                self.soc_tcp_pending.pop(addr, None)
+                LOG.info("SOC Modbus TCP verified: %s=%d (%.1fs after BLE ACK)",
+                         field, actual, sample_at - ack_at)
+            elif sample_at - ack_at >= 20:
+                self.soc_tcp_pending.pop(addr, None)
+                LOG.warning("SOC Modbus TCP verification timeout: %s target=%d actual=%s; "
+                            "not confirmed (no automatic FC06 retry)",
+                            field, target, actual)
+
     async def modbus_polling(self):
         """Independent Modbus TCP telemetrics, no Modbus writes."""
         if not self.opts.modbus_host:
@@ -1174,25 +1197,7 @@ class Bridge:
                     recovered = self.modbus_failure_logged or not self.modbus_last_ok
                     self.modbus_last_ok = time.monotonic()
                     self.modbus_recent_fields = set(data)
-                    # Confirm only via real TCP values sampled *after* BLE ACK.
-                    # An FC06 echo alone never counts as hardware verification.
-                    for addr, field in ((3015, "battery_range_start"),
-                                        (3016, "battery_range_end")):
-                        pending = self.soc_tcp_pending.get(addr)
-                        if pending is None:
-                            continue
-                        target, ack_at = pending
-                        actual = data.get(field)
-                        if actual == target and self.modbus_last_ok >= ack_at:
-                            self.commands.mark_verified(addr, actual, self.modbus_last_ok)
-                            self.soc_tcp_pending.pop(addr, None)
-                            LOG.info("SOC Modbus TCP verified: %s=%d (%.1fs after BLE ACK)",
-                                     field, actual, self.modbus_last_ok - ack_at)
-                        elif self.modbus_last_ok - ack_at >= 20:
-                            self.soc_tcp_pending.pop(addr, None)
-                            LOG.warning("SOC Modbus TCP verification timeout: %s target=%d actual=%s; "
-                                        "not confirmed (no automatic FC06 retry)",
-                                        field, target, actual)
+                    self.reconcile_soc_tcp(data, self.modbus_last_ok)
                     # Also maintain the BLE register cache used for safe SOC
                     # start/end validation; Modbus state is read from hardware.
                     if "battery_range_start" in data:
