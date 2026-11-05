@@ -17,6 +17,7 @@ from cryptography.exceptions import InvalidSignature
 from typing import Any
 from hybrid_modbus import AC500ModbusReader, MODBUS_FIELDS
 from command_mailbox import CommandMailbox
+from pack_scan_progress import PackScanProgress
 
 import paho.mqtt.client as mqtt
 from bluetti_bt_lib.devices.ac500 import AC500
@@ -557,6 +558,8 @@ class Bridge:
         self.last_registers: dict[int, int] = {}
         self.active_pack_slots: set[int] = set()
         self.last_full_pack_scan = 0.0
+        self.pack_scan: PackScanProgress | None = None
+        self.pack_resume_delay = None
         self.modbus_last_ok = 0.0
         self.modbus_publishing = False
         self.modbus_recent_fields = set()
@@ -726,89 +729,116 @@ class Bridge:
             topic = f"homeassistant/sensor/{self.opts.serial}_{legacy_id}/config"
             self.mqtt.publish(topic, json.dumps(payload), qos=1, retain=True)
 
-    async def poll_packs_once(self, full_scan: bool):
-        slots = (list(range(1, 7)) if full_scan or not self.active_pack_slots
-                 else sorted(self.active_pack_slots))
-        present: dict[int, dict[str, Any]] = {}
-        absent: set[int] = set()
-        failures: set[int] = set()
-        restore_failures: set[int] = set()
-        interrupted = False
+    def publish_pack_sample(self, slot: int, details: dict[str, Any]):
+        """Publish only validated hardware data, never synthetic zero/unknown."""
+        self.publish_pack_discovery(slot)
+        self.publish(f"battery_pack_{slot}_percent", details["percent"])
+        self.publish(f"battery_pack_{slot}_voltage", details["voltage"])
+        self.mqtt.publish(self.prefix + f"pack_details{slot}",
+                          json.dumps(details, separators=(",", ":")),
+                          qos=1, retain=True)
 
-        # Crucial dev8 change: one handshake/read/selector/restore/disconnect
-        # per pack. Dev7 held a single encrypted BLE session across all six
-        # slots; on this AC500 the third read failed and poisoned the session.
-        for slot in slots:
+    async def poll_packs_once(self, full_scan: bool):
+        # Resume the unfinished scan first; do not restart from slot 1 each
+        # time the surplus automation preempts us. New cycles begin only after
+        # the previous one has genuinely completed.
+        if self.pack_scan is None:
+            slots = (list(range(1, 7)) if full_scan or not self.active_pack_slots
+                     else sorted(self.active_pack_slots))
+            kind = "full" if full_scan or not self.active_pack_slots else "active"
+            self.pack_scan = PackScanProgress.begin(kind, slots)
+            LOG.info("B300 %s scan started: targets=%s", kind, slots)
+        else:
+            LOG.info("B300 %s scan resuming: pending=%s acquired=%s empty=%s",
+                     self.pack_scan.kind, self.pack_scan.remaining,
+                     sorted(self.pack_scan.acquired), sorted(self.pack_scan.empty))
+
+        progress = self.pack_scan
+        status = "preempted"  # Includes stop_event, unless fully completed.
+        # A failed scan remains resumable too, but back off to the normal
+        # interval instead of reconnecting continuously on a broken radio.
+        for slot in list(progress.remaining):
             if self.stop_event.is_set():
                 break
-            # A newly queued write can arrive between checking the queue and
-            # acquiring the session lock.  Recheck under the lock, release it
-            # and let the command worker proceed before this B300 probe.
-            reader = self.new_reader(PackPollingReader, targets=[slot], priority_event=self.pending_write)
+
+            reader = self.new_reader(PackPollingReader, targets=[slot],
+                                     priority_event=self.pending_write)
             try:
-                while not self.stop_event.is_set():
-                    await self.wait_for_pending_writes()
-                    if self.stop_event.is_set():
-                        break
-                    retry_for_write = False
-                    async with self.ble_session_lock:
-                        if self.pending_write.is_set():
-                            retry_for_write = True
-                        else:
-                            try:
-                                await reader.read(
-                                    only_registers=[ReadableRegisters(PACK_SELECTOR, 1)],
-                                    raw=True)
-                                if reader.was_preempted:
-                                    # DeviceReader can swallow callback exceptions.
-                                    raise PackScanPreempted()
-                            finally:
-                                # Protect the next encrypted handshake.
-                                await asyncio.sleep(2)
-                    if not retry_for_write:
-                        break
+                # Check both before and *after* taking the BLE session lock.
+                # Only the command worker may clear pending_write.
+                await self.wait_for_pending_writes()
                 if self.stop_event.is_set():
                     break
-                present.update(reader.packs)
-                absent.update(reader.empty_slots)
-                failures.update(reader.failed_slots)
-                if not reader.restore_ok:
-                    restore_failures.add(slot)
-                if slot not in reader.packs and slot not in reader.empty_slots:
-                    failures.add(slot)
-            except PackScanPreempted:
-                interrupted = True
-                # Revisit the slot on the next scan, rather than publishing
-                # a false failure or marking the full scan complete.
-                break
-            except Exception as exc:
-                failures.add(slot)
-                LOG.warning("B300 slot %d isolated session failed: %s", slot, exc)
-            # Leave a gap between encrypted handshakes and yield to writes.
-            # Continue to other slots if one has failed.
-            await asyncio.sleep(3)
-            await self.wait_for_pending_writes()
+                async with self.ble_session_lock:
+                    if self.pending_write.is_set():
+                        LOG.info("B300 slot %d preempted before BLE connection", slot)
+                        break
+                    try:
+                        response = await reader.read(
+                            only_registers=[ReadableRegisters(PACK_SELECTOR, 1)],
+                            raw=True)
+                    finally:
+                        # Existing BlueZ handshakes require a short quiet gap.
+                        await asyncio.sleep(2)
 
-        if full_scan:
-            # Only validated zero-voltage responses mark an empty slot.
-            self.active_pack_slots.difference_update(absent)
-            if not interrupted:
+                # bluetti-bt-lib swallows callback exceptions and can return
+                # None even when our reader marked itself as preempted.
+                if reader.was_preempted or self.pending_write.is_set():
+                    LOG.info("B300 slot %d preempted for MQTT; preserving previous samples", slot)
+                    break
+
+                if not reader.restore_ok:
+                    raise RuntimeError(f"B300 slot {slot} selector restore unconfirmed")
+                if reader.packs.get(slot) is not None:
+                    details = reader.packs[slot]
+                    progress.record(slot, populated=True)
+                    self.active_pack_slots.add(slot)
+                    self.publish_pack_sample(slot, details)
+                elif slot in reader.empty_slots:
+                    progress.record(slot, populated=False)
+                    self.active_pack_slots.discard(slot)
+                    # Do not overwrite any retained HA values with fabricated
+                    # zero/unknown data. A proven empty slot is not published.
+                else:
+                    raise RuntimeError(
+                        f"B300 slot {slot}: no validated sample "
+                        f"(read result={'none' if response is None else 'incomplete'})")
+            except Exception as exc:
+                progress.failed(slot)
+                LOG.warning("B300 slot %d scan failed, will retry later: %s", slot, exc)
+                status = "partial"
+                break
+
+            # Yield between isolated sessions. Never monopolise BlueZ while
+            # the charge automation is issuing fresh MQTT setpoints.
+            await asyncio.sleep(3)
+            if self.pending_write.is_set():
+                LOG.info("B300 scan paused between slots for queued MQTT command")
+                break
+
+        if progress.complete:
+            status = "complete"
+            if progress.kind == "full":
                 self.last_full_pack_scan = time.monotonic()
-        self.active_pack_slots.update(present)
-        for slot, details in present.items():
-            self.publish_pack_discovery(slot)
-            # Keep scalar MQTT state for direct consumers, but the original
-            # Home Assistant entities consume JSON via pack_detailsN.
-            self.publish(f"battery_pack_{slot}_percent", details["percent"])
-            self.publish(f"battery_pack_{slot}_voltage", details["voltage"])
-            self.mqtt.publish(self.prefix + f"pack_details{slot}",
-                              json.dumps(details, separators=(",", ":")),
-                              qos=1, retain=True)
-        LOG.info("B300 %s scan complete: targets=%s present=%s known=%s "
-                 "empty=%s failures=%s restore_failures=%s",
-                 "full" if full_scan else "active", slots, sorted(present),
-                 sorted(self.active_pack_slots), sorted(absent),
-                 sorted(failures), sorted(restore_failures))
+            LOG.info("B300 %s scan complete: acquired=%s empty=%s known=%s failures=%s",
+                     progress.kind, sorted(progress.acquired),
+                     sorted(progress.empty), sorted(self.active_pack_slots),
+                     sorted(progress.failures))
+            self.pack_scan = None
+            self.pack_resume_delay = self.opts.pack_poll_sec
+        else:
+            # Failures must not be marked complete. An interruption does not
+            # reset the full-scan clock or lose previously acquired slots.
+            if status == "partial":
+                self.pack_resume_delay = self.opts.pack_poll_sec
+            else:
+                status = "preempted"
+                self.pack_resume_delay = 15
+            LOG.info("B300 %s scan %s: pending=%s acquired=%s empty=%s "
+                     "failures=%s; resume in %ss",
+                     progress.kind, status, progress.remaining,
+                     sorted(progress.acquired), sorted(progress.empty),
+                     sorted(progress.failures), self.pack_resume_delay)
 
     async def pack_polling(self):
         # Let main AC500 polling establish the first encrypted session.
@@ -823,8 +853,9 @@ class Bridge:
                 await self.poll_packs_once(full_scan)
             except Exception:
                 LOG.exception("B300 pack polling error (regular polling continues)")
+            delay = self.pack_resume_delay or self.opts.pack_poll_sec
             try:
-                await asyncio.wait_for(self.stop_event.wait(), timeout=self.opts.pack_poll_sec)
+                await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
             except asyncio.TimeoutError:
                 pass
 
