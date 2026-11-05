@@ -1,4 +1,4 @@
-# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta8)
+# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta9)
 
 **Experimental third Home Assistant add-on**, independent of:
 - Bluetti2MQTT Plus 3.0.3 (legacy);
@@ -55,13 +55,13 @@ guarantee is possible while the BLE session is busy.
 - The first BLE cold poll may occur before the first Modbus success. MQTT
   consumers must rely on their own staleness checks in case both transports fail.
 
-## v1.0.0-beta8 — MQTT command priority
+## v1.0.0-beta9 — MQTT command priority
 - Abort B300's noncritical 10-second settle wait when an MQTT command arrives; restore B300 selector before releasing the BLE session.
 - FC06 write echo followed by FC03 read-back **within the same encrypted connection**; publish the actual read-back state only if verified.
 - Command queue dispatch latency logged; unsuccessful read-back triggers a prompt full BLE recheck.
 - Modbus telemetry and normal BLE/B300 scheduling unchanged.
 
-## v1.0.0-beta8 — delayed FC06 state verification
+## v1.0.0-beta9 — delayed FC06 state verification
 - FC06 echo means acknowledged, not necessarily applied. The AC500 may keep
   returning the previous register value for several seconds.
 - Three bounded FC03 read-back attempts in the SAME encrypted BLE session;
@@ -72,7 +72,7 @@ guarantee is possible while the BLE session is busy.
   **pending**, then request the existing BLE polling reconciliation.
 - The command state is never set optimistically from the requested payload.
 
-## v1.0.0-beta8 — high-frequency MQTT setpoints
+## v1.0.0-beta9 — high-frequency MQTT setpoints
 
 The Home Assistant surplus automation **does not need to be throttled**. The
 bridge now maintains a bounded **last-value-wins mailbox per physical BLE
@@ -93,7 +93,7 @@ register** (aliases coalesce by address):
 If the device does not respond to encrypted BLE, no software can guarantee
 instant writes. The mailbox prevents a backlog while communication recovers.
 
-## v1.0.0-beta8 — faster charge-current state reconciliation
+## v1.0.0-beta9 — faster charge-current state reconciliation
 
 The AC500 commonly acknowledges FC06 before its register 3019 reports the
 new charge-current value. Repeated FC03 verification within a single BLE
@@ -112,7 +112,7 @@ session holds the Bluetooth lock but often observes the old value.
 Actual update latency is limited by the AC500 BLE handshake, firmware and
 hardware settling time; no instantaneous acknowledgement is assumed.
 
-## v1.0.0-beta8 — experimental fast encrypted charge-current session
+## v1.0.0-beta9 — experimental fast encrypted charge-current session
 
 Verified on AC500: ECDSA handshake can be reused for repeated FC03 and a
 FC03→FC06→FC03 sequence. Register 3019 becomes readable roughly 4 seconds
@@ -140,7 +140,7 @@ This is an experimental change. Keep the Secure BLE 4.0.2 add-on stopped while
 Hybrid is running. Use logs `BLE fast session` and `BLE fast session hardware`
 for timing analysis.
 
-## v1.0.0-beta8 — early BLE disconnect after verification
+## v1.0.0-beta9 — early BLE disconnect after verification
 
 For the AC500 charge-current fast path (register 3019), the encrypted BLE
 session now closes after **2 seconds of idle time following confirmed FC03
@@ -154,7 +154,7 @@ probing, charge-surplus automation frequency, or Last Value Wins semantics.
 Also prevents treating a pre-FC06 read as current hardware state when a rapid
 subsequent setpoint returns to the earlier value.
 
-## v1.0.0-beta8 — resumable, MQTT-priority B300 pack scans
+## v1.0.0-beta9 — resumable, MQTT-priority B300 pack scans
 
 - Preserve every validated B300 pack sample as soon as a slot is scanned;
   previously published battery values are retained during interruptions.
@@ -174,3 +174,30 @@ subsequent setpoint returns to the earlier value.
   Modbus TCP and automation timing remain unchanged from beta7.
 
 Scan progress is held in memory and restarts cleanly on add-on restart.
+
+## v1.0.0-beta9 — Modbus-first telemetry / optional B300 diagnostics
+
+With Modbus TCP healthy, the full encrypted BLE polling interval is at least
+600 seconds (instead of the previously configured default 120 seconds); it
+falls back to a 15-second BLE cadence if Modbus TCP becomes unavailable.
+Normal BLE FC06 writes, including grid_charge_amps, are not delayed by this
+polling change. The 2-second verified idle disconnect remains active.
+
+The AC500's independently verified Modbus TCP read addresses 57016–57017
+now feed existing MQTT entities `battery_range_start` and `battery_range_end`
+(SOC *configuration limits*, distinct from current battery SOC at 51004).
+AC/DC output state topics also come from 57001/57005. Existing BLE writes
+remain unchanged: Modbus TCP is **read only**, and FC06 completion must be
+confirmed from actual hardware, not merely the requested target value.
+
+A new add-on option `pack_poll_enabled: false` disables periodic encrypted
+B300 scans by default; set it to `true` to restore the beta8 resumable pack
+scan behaviour. Previously published pack state topics are not deleted or
+zeroed, but their values will become stale while pack polling is disabled.
+The 600s BLE diagnostic refresh is distinct from B300 scans. The Modbus TCP
+client remains one persistent connection per add-on instance.
+
+The correlation between Modbus SOC thresholds and Bluetooth FC06 settings
+should be validated on the user's AC500 firmware before replacing the BLE
+read-back of SOC writes. The beta9 design leaves the verified BLE writer
+unchanged for this reason.
