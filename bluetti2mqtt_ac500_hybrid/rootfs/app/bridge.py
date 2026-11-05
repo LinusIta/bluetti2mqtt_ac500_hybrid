@@ -194,6 +194,7 @@ class Settings:
     allow_writes: bool
     pack_poll_sec: int
     pack_scan_sec: int
+    pack_poll_enabled: bool
     modbus_host: str
     modbus_port: int
     modbus_poll_sec: int
@@ -217,6 +218,7 @@ class Settings:
             allow_writes=bool(data.get("allow_writes", False)),
             pack_poll_sec=max(90, int(data.get("pack_poll_sec", 600))),
             pack_scan_sec=max(600, int(data.get("pack_scan_sec", 3600))),
+            pack_poll_enabled=bool(data.get("pack_poll_enabled", False)),
             modbus_host=str(data.get("modbus_host", "")).strip(),
             modbus_port=int(data.get("modbus_port", 502)),
             modbus_poll_sec=max(2, int(data.get("modbus_poll_sec", 5))),
@@ -551,6 +553,7 @@ class Bridge:
         self.device.max_packs = 0  # preview: disable battery pack selector writes
         self.commands = CommandMailbox(max_age=45.0, verified_ttl=30.0)
         self.pending_write = asyncio.Event()
+        self.pack_scan_request = asyncio.Event()
         self.crypto_faults = 0
         self.loop = asyncio.get_running_loop()
         self.lock = asyncio.Lock()  # DeviceReader internal request lock
@@ -601,7 +604,18 @@ class Bridge:
             value = msg.payload.decode("utf-8").strip()
         except UnicodeDecodeError:
             return
+        if field == "scan_b300":
+            if value.upper() in ("SCAN", "ON", "1"):
+                self.loop.call_soon_threadsafe(self.request_pack_scan)
+            else:
+                LOG.warning("Ignored scan_b300 MQTT payload %r (use SCAN)", value)
+            return
         self.loop.call_soon_threadsafe(self.enqueue_command, field, value)
+
+    def request_pack_scan(self):
+        # Explicit one-shot B300 request. Never add this to the FC06 mailbox.
+        self.pack_scan_request.set()
+        LOG.info("Manual B300 full scan requested via MQTT")
 
     def enqueue_command(self, field: str, value: str):
         # Last desired value wins per physical register (alias-aware).
@@ -844,18 +858,42 @@ class Bridge:
                      sorted(progress.failures), self.pack_resume_delay)
 
     async def pack_polling(self):
-        # Let main AC500 polling establish the first encrypted session.
-        try:
-            await asyncio.wait_for(self.stop_event.wait(), timeout=120)
-            return
-        except asyncio.TimeoutError:
-            pass
+        # Automatic B300 collection is opt-in. With the option disabled,
+        # a read-only one-shot scan can be requested by publishing 'SCAN'
+        # to bluetti/command/AC500-<serial>/scan_b300. Resume partial scans
+        # after MQTT preemption until they are genuinely complete.
+        if self.opts.pack_poll_enabled:
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=120)
+                return
+            except asyncio.TimeoutError:
+                pass
+        else:
+            LOG.info("B300 background scanning disabled; manual MQTT scan_b300 available")
+
         while not self.stop_event.is_set():
-            full_scan = (time.monotonic() - self.last_full_pack_scan >= self.opts.pack_scan_sec)
+            if not self.opts.pack_poll_enabled and self.pack_scan is None:
+                # Do not monopolize BLE while idle. No polling traffic at all.
+                # Small wait timeout ensures SIGTERM can stop the task.
+                try:
+                    await asyncio.wait_for(self.pack_scan_request.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    continue
+                self.pack_scan_request.clear()
+
+            # Manual scan requests override the automatic schedule once,
+            # then return to the normal enabled/disabled mode.
+            requested = self.pack_scan_request.is_set()
+            self.pack_scan_request.clear()
+            full_scan = (requested or self.pack_scan is not None or
+                         time.monotonic() - self.last_full_pack_scan >= self.opts.pack_scan_sec)
             try:
                 await self.poll_packs_once(full_scan)
             except Exception:
                 LOG.exception("B300 pack polling error (regular polling continues)")
+
+            if not self.opts.pack_poll_enabled and self.pack_scan is None:
+                continue  # a one-shot full scan is finished, wait for next request
             delay = self.pack_resume_delay or self.opts.pack_poll_sec
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
@@ -1054,7 +1092,18 @@ class Bridge:
                         field, payload, reader.verified_value,
                         reader.readback_attempts, reader.readback_superseded)
             if not reader.readback_superseded:
-                self.refresh_requested.set()
+                modbus_ok = bool(
+                    self.modbus_last_ok
+                    and time.monotonic() - self.modbus_last_ok
+                    < max(15, self.opts.modbus_poll_sec * 3)
+                )
+                if address in (3015, 3016) and modbus_ok:
+                    # 57016/57017 provide independent live hardware SOC
+                    # config state. Let the 5s TCP poll observe convergence,
+                    # instead of forcing another full 29-block BLE session.
+                    LOG.info("SOC FC06 ACK; awaiting Modbus TCP threshold state")
+                else:
+                    self.refresh_requested.set()
         # Do not retry the write automatically: a duplicate or old command can
         # override a newer operator request. Next BLE polling reconciles state.
 
@@ -1102,6 +1151,12 @@ class Bridge:
                     recovered = self.modbus_failure_logged or not self.modbus_last_ok
                     self.modbus_last_ok = time.monotonic()
                     self.modbus_recent_fields = set(data)
+                    # Also maintain the BLE register cache used for safe SOC
+                    # start/end validation; Modbus state is read from hardware.
+                    if "battery_range_start" in data:
+                        self.last_registers[3015] = data["battery_range_start"]
+                    if "battery_range_end" in data:
+                        self.last_registers[3016] = data["battery_range_end"]
                     self.modbus_failure_logged = False
                     self.modbus_publishing = True
                     try:
@@ -1146,12 +1201,23 @@ class Bridge:
             # loop of repeated BLE handshakes.
             # Fail back to the old ~15-second BLE cadence while Modbus is down.
             modbus_ok = bool(self.modbus_last_ok and time.monotonic() - self.modbus_last_ok < max(15, self.opts.modbus_poll_sec * 3))
-            interval = self.opts.poll_sec if modbus_ok else 15
+            # When Modbus is healthy, periodic full BLE telemetry is a rare
+            # diagnostic refresh. FC06 writes and explicit read-back wakeups
+            # still run immediately, irrespective of this interval.
+            interval = max(600, self.opts.poll_sec) if modbus_ok else 15
             delay = max(2.0 if failed else 0.0, interval - elapsed)
             # Wake a periodic BLE reader promptly for command read-back;
             # keep commands prioritised by the existing pending_write gate.
             end = time.monotonic() + delay
             while not self.stop_event.is_set() and not self.refresh_requested.is_set():
+                if modbus_ok and not (
+                    self.modbus_last_ok and time.monotonic() - self.modbus_last_ok
+                    < max(15, self.opts.modbus_poll_sec * 3)
+                ):
+                    # Do not remain asleep for 10 minutes if Modbus dies:
+                    # immediately restart short-cadence BLE telemetry.
+                    LOG.warning("Modbus stale; resuming BLE telemetry fallback")
+                    break
                 remaining = end - time.monotonic()
                 if remaining <= 0:
                     break

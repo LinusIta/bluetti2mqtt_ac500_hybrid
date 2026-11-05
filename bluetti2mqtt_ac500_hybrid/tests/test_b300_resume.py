@@ -97,13 +97,14 @@ class ScanBridge:
         self.behaviour = behaviour
         self.visited = []
         self.pending_write = asyncio.Event()
+        self.pack_scan_request = asyncio.Event()
         self.ble_session_lock = asyncio.Lock()
         self.stop_event = asyncio.Event()
         self.pack_scan = None
         self.pack_resume_delay = None
         self.active_pack_slots = set()
         self.last_full_pack_scan = 0
-        self.opts = types.SimpleNamespace(pack_poll_sec=600)
+        self.opts = types.SimpleNamespace(pack_poll_sec=600, pack_poll_enabled=False, pack_scan_sec=3600)
         self.prefix = "bluetti/state/test/"
         self.mqtt = FakeMQTT()
         self.publications = []
@@ -132,7 +133,7 @@ def load_bridge_scan_methods():
     parsed = ast.parse(root.read_text())
     bridge = next(n for n in parsed.body
                   if isinstance(n, ast.ClassDef) and n.name == "Bridge")
-    names = {"publish_pack_sample", "poll_packs_once"}
+    names = {"publish_pack_sample", "poll_packs_once", "pack_polling"}
     methods = [n for n in bridge.body
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
     # Re-use the production methods without importing Home Assistant BLE libs.
@@ -151,7 +152,9 @@ def load_bridge_scan_methods():
         "PACK_SELECTOR": 3006,
         "PackPollingReader": object,
         "time": time,
-        "asyncio": types.SimpleNamespace(sleep=quick_sleep),
+        "asyncio": types.SimpleNamespace(sleep=quick_sleep,
+                                         wait_for=asyncio.wait_for,
+                                         TimeoutError=asyncio.TimeoutError),
         "LOG": logging.getLogger("fake-b300"),
         "json": __import__("json"),
     }
@@ -195,6 +198,27 @@ class TestResumableB300(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.visited, [1, 2, 2, 3, 4, 5, 6])
         self.assertIsNone(bridge.pack_scan)
         self.assertGreater(bridge.last_full_pack_scan, 0)
+
+    async def test_disabled_pack_scan_runs_only_on_manual_request(self):
+        bridge = BridgeUnderTest({})
+        task = asyncio.create_task(bridge.pack_polling())
+        try:
+            await asyncio.sleep(0.02)
+            self.assertEqual(bridge.visited, [])
+            bridge.pack_scan_request.set()
+            await asyncio.sleep(0.08)
+            self.assertEqual(bridge.visited, [1, 2, 3, 4, 5, 6])
+            self.assertIsNone(bridge.pack_scan)
+            self.assertFalse(bridge.pack_scan_request.is_set())
+            await asyncio.sleep(0.02)
+            self.assertEqual(len(bridge.visited), 6)
+        finally:
+            bridge.stop_event.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     async def test_pending_mqtt_command_prevents_any_ble_scan(self):
         bridge = BridgeUnderTest({})
