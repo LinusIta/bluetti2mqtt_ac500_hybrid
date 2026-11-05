@@ -4,6 +4,9 @@ No asyncio dependencies: single Home Assistant event-loop thread owns this
 mailbox. Different aliases for the same hardware register share one slot.
 """
 from collections import OrderedDict
+import logging
+
+LOG = logging.getLogger("bluetti2mqtt_plus")
 
 
 class CommandMailbox:
@@ -49,7 +52,8 @@ class CommandMailbox:
             address, (field, payload, numeric, received_at) = self.pending.popitem(last=False)
             if now - received_at > self.max_age:
                 # Never execute an obsolete command after a long BLE timeout.
-                # A more recent MQTT event will be queued normally.
+                LOG.warning("Expired MQTT setpoint %s=%s (%.1fs queued); not sent to BLE",
+                            field, payload, now - received_at)
                 continue
             self.active = (address, numeric)
             return address, field, payload, numeric, received_at
