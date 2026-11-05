@@ -553,6 +553,7 @@ class Bridge:
         self.device.max_packs = 0  # preview: disable battery pack selector writes
         self.commands = CommandMailbox(max_age=45.0, verified_ttl=30.0)
         self.pending_write = asyncio.Event()
+        self.pack_scan_request = asyncio.Event()
         self.crypto_faults = 0
         self.loop = asyncio.get_running_loop()
         self.lock = asyncio.Lock()  # DeviceReader internal request lock
@@ -603,7 +604,18 @@ class Bridge:
             value = msg.payload.decode("utf-8").strip()
         except UnicodeDecodeError:
             return
+        if field == "scan_b300":
+            if value.upper() in ("SCAN", "ON", "1"):
+                self.loop.call_soon_threadsafe(self.request_pack_scan)
+            else:
+                LOG.warning("Ignored scan_b300 MQTT payload %r (use SCAN)", value)
+            return
         self.loop.call_soon_threadsafe(self.enqueue_command, field, value)
+
+    def request_pack_scan(self):
+        # Explicit one-shot B300 request. Never add this to the FC06 mailbox.
+        self.pack_scan_request.set()
+        LOG.info("Manual B300 full scan requested via MQTT")
 
     def enqueue_command(self, field: str, value: str):
         # Last desired value wins per physical register (alias-aware).
@@ -846,23 +858,42 @@ class Bridge:
                      sorted(progress.failures), self.pack_resume_delay)
 
     async def pack_polling(self):
-        # B300 diagnostics are optional: disabled by default to reserve BLE
-        # exclusively for surplus setpoints and control read-back.
-        if not self.opts.pack_poll_enabled:
-            LOG.info("B300 automatic BLE scanning disabled (pack_poll_enabled=false)")
-            return
-        # Let main AC500 polling establish the first encrypted session.
-        try:
-            await asyncio.wait_for(self.stop_event.wait(), timeout=120)
-            return
-        except asyncio.TimeoutError:
-            pass
+        # Automatic B300 collection is opt-in. With the option disabled,
+        # a read-only one-shot scan can be requested by publishing 'SCAN'
+        # to bluetti/command/AC500-<serial>/scan_b300. Resume partial scans
+        # after MQTT preemption until they are genuinely complete.
+        if self.opts.pack_poll_enabled:
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=120)
+                return
+            except asyncio.TimeoutError:
+                pass
+        else:
+            LOG.info("B300 background scanning disabled; manual MQTT scan_b300 available")
+
         while not self.stop_event.is_set():
-            full_scan = (time.monotonic() - self.last_full_pack_scan >= self.opts.pack_scan_sec)
+            if not self.opts.pack_poll_enabled and self.pack_scan is None:
+                # Do not monopolize BLE while idle. No polling traffic at all.
+                # Small wait timeout ensures SIGTERM can stop the task.
+                try:
+                    await asyncio.wait_for(self.pack_scan_request.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    continue
+                self.pack_scan_request.clear()
+
+            # Manual scan requests override the automatic schedule once,
+            # then return to the normal enabled/disabled mode.
+            requested = self.pack_scan_request.is_set()
+            self.pack_scan_request.clear()
+            full_scan = (requested or self.pack_scan is not None or
+                         time.monotonic() - self.last_full_pack_scan >= self.opts.pack_scan_sec)
             try:
                 await self.poll_packs_once(full_scan)
             except Exception:
                 LOG.exception("B300 pack polling error (regular polling continues)")
+
+            if not self.opts.pack_poll_enabled and self.pack_scan is None:
+                continue  # a one-shot full scan is finished, wait for next request
             delay = self.pack_resume_delay or self.opts.pack_poll_sec
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
