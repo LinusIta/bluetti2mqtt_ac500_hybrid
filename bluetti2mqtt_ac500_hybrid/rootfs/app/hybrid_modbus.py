@@ -12,6 +12,8 @@ MODBUS_FIELDS = frozenset({
     "total_battery_percent", "battery_soc", "total_battery_voltage",
     "total_battery_current", "ac_input_frequency", "dc_input_power1",
     "dc_input_voltage1", "dc_input_power2",
+    "battery_range_start", "battery_range_end",
+    "ac_output_on", "dc_output_on",
 })
 
 class AC500ModbusReader:
@@ -68,7 +70,12 @@ class AC500ModbusReader:
         pv1, pv1_voltage = await self.holding(50269, 2)
         pv2 = (await self.holding(50273, 1))[0]
         bat_voltage, bat_current, soc = await self.holding(51002, 3)
-        if not (0 <= soc <= 100 and 250 <= bat_voltage <= 700 and (freq == 0 or 4000 <= freq <= 7000)):
+        ac_switch = (await self.holding(57001, 1))[0]
+        dc_switch = (await self.holding(57005, 1))[0]
+        soc_min, soc_max = await self.holding(57016, 2)
+        if not (0 <= soc <= 100 and 250 <= bat_voltage <= 700 and (freq == 0 or 4000 <= freq <= 7000)
+                and 0 <= soc_min <= 100 and 0 <= soc_max <= 100 and soc_min <= soc_max
+                and ac_switch in (0, 1) and dc_switch in (0, 1)):
             raise ValueError("Implausible AC500 Modbus voltage/SOC/frequency")
         values = {
             "ac_output_power": ac_local,
@@ -81,6 +88,12 @@ class AC500ModbusReader:
             "dc_input_power1": pv1,
             "dc_input_voltage1": round(pv1_voltage * 0.1, 1),
             "dc_input_power2": pv2,
+            # Read-only mirrors of BLE 3015/3016. These are live states,
+            # not proof of FC06 completion until cross-checked on hardware.
+            "battery_range_start": soc_min,
+            "battery_range_end": soc_max,
+            "ac_output_on": "ON" if ac_switch else "OFF",
+            "dc_output_on": "ON" if dc_switch else "OFF",
         }
         # Off-grid devices may report no mains frequency; leave BLE authoritative.
         if freq:
