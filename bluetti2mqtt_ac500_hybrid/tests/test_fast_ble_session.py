@@ -198,6 +198,44 @@ class TestChargeSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.commands.verified[3019][0], 4)
         self.assertNotIn(3015, bridge.commands.verified)
 
+    async def test_soc_first_then_ampere_reuses_single_ble_session(self):
+        bridge = FakeBridge()
+        bridge.last_registers[3015] = 100
+        bridge.commands.put(3015, "battery_range_start", "20", 20, time.monotonic())
+        first = bridge.commands.pop(time.monotonic())
+        self.assertEqual(first[0], 3015)
+        reader = ChargeSessionReader(
+            bridge=bridge, first_field="battery_range_start", first_value=20)
+
+        async def later_current():
+            await asyncio.sleep(0.065)
+            bridge.commands.put(3019, "grid_charge_amps", "8", 8, time.monotonic())
+
+        await asyncio.gather(reader._async_send_command(ReadableRegisters(3019, 1)),
+                             later_current())
+        self.assertEqual(reader.soc_writes, [(3015, 20)])
+        self.assertEqual(reader.writes, [8])
+        self.assertEqual(reader.verified, 1)
+        self.assertEqual(bridge.commands.verified[3019][0], 8)
+        self.assertEqual(bridge.soc_tcp_pending[3015][0], 20)
+        self.assertNotIn(3015, bridge.commands.verified)
+        self.assertFalse(bridge.commands.has_pending)
+
+    async def test_soc_first_only_closes_after_short_pair_window(self):
+        bridge = FakeBridge()
+        bridge.last_registers[3015] = 100
+        bridge.commands.put(3015, "battery_range_start", "20", 20, time.monotonic())
+        bridge.commands.pop(time.monotonic())
+        reader = ChargeSessionReader(
+            bridge=bridge, first_field="battery_range_start", first_value=20)
+        reader.SOC_PAIR_IDLE_SECONDS = 0.14
+        started = time.monotonic()
+        await reader._async_send_command(ReadableRegisters(3019, 1))
+        self.assertEqual(reader.soc_writes, [(3015, 20)])
+        self.assertEqual(reader.writes, [])
+        self.assertGreaterEqual(time.monotonic() - started, 0.14)
+        self.assertLess(time.monotonic() - started, 0.5)
+
     async def test_identical_inflight_setpoint_does_not_repeat_fc06(self):
         bridge = FakeBridge()
         bridge.commands.put(3019, "grid_charge_amps", "4", 4, time.monotonic())
