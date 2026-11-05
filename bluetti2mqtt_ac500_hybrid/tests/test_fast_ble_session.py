@@ -42,10 +42,14 @@ class FakeDeviceReader:
         self.future_value = None
         self.applies_at = 0.0
         self.writes = []
+        self.soc_writes = []
 
     async def _async_send_command(self, register):
         await asyncio.sleep(0.002)
         if isinstance(register, WriteableRegister):
+            if register.address in (3015, 3016):
+                self.soc_writes.append((register.address, register.value))
+                return bytes(register)
             self.writes.append(register.value)
             self.future_value = register.value
             self.applies_at = time.monotonic() + 0.08
@@ -186,6 +190,7 @@ class TestChargeSession(unittest.IsolatedAsyncioTestCase):
         # different Modbus address written in the same encrypted session.
         original = reader._async_send_command
         await original(ReadableRegisters(3019, 1))
+        self.assertEqual(reader.soc_writes, [(3015, 20)])
         self.assertIn(3015, bridge.soc_tcp_pending)
         self.assertEqual(bridge.soc_tcp_pending[3015][0], 20)
         self.assertNotIn(3015, bridge.commands.pending)
