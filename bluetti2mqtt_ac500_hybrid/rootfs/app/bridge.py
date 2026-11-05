@@ -226,7 +226,7 @@ class Settings:
 
 class OneWriteReader(DeviceReader):
     """Execute exactly one FC06 from a read session; check returned Modbus echo."""
-    def __init__(self, *args, address: int, new_value: int, newer_command_waiting=None, **kwargs):
+    def __init__(self, *args, address: int, new_value: int, newer_command_waiting=None, tcp_readback=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.address = address
         self.new_value = new_value
@@ -236,6 +236,7 @@ class OneWriteReader(DeviceReader):
         self.newer_command_waiting = newer_command_waiting or (lambda: False)
         self.readback_attempts = 0
         self.readback_superseded = False
+        self.tcp_readback = tcp_readback
 
     async def _async_send_command(self, register):
         original = await super()._async_send_command(register)
@@ -256,6 +257,12 @@ class OneWriteReader(DeviceReader):
         # Make at most ONE immediate FC03 verification (no delay loops).
         # Any delayed update is reconciled by a scheduled normal BLE poll,
         # so this session can disconnect and release newer surplus commands.
+        if self.tcp_readback:
+            # 57016/57017 are hardware-backed read-only Modbus TCP state.
+            # Do not spend another BLE GATT round trip verifying SOC here.
+            # The bridge will independently correlate a later TCP poll with
+            # the requested value, after this FC06 acknowledgement.
+            return original
         if self.newer_command_waiting():
             self.readback_superseded = True
         else:
@@ -570,6 +577,9 @@ class Bridge:
         self.modbus_publishing = False
         self.modbus_recent_fields = set()
         self.modbus_failure_logged = False
+        # addr 3015/3016 -> (target, BLE-ack timestamp). Only an
+        # independent post-ACK TCP sample can confirm hardware application.
+        self.soc_tcp_pending = {}
         self.refresh_requested = asyncio.Event()
         self.prefix = f"bluetti/state/AC500-{opts.serial}/"
         self.command_prefix = f"bluetti/command/AC500-{opts.serial}/"
@@ -1065,8 +1075,12 @@ class Bridge:
                 LOG.error("BLE fast session failed; do not replay uncertain FC06")
             return
         started = time.monotonic()
+        tcp_soc = (address in (3015, 3016) and bool(
+            self.modbus_last_ok and time.monotonic() - self.modbus_last_ok
+            < max(15, self.opts.modbus_poll_sec * 3)))
         reader = self.new_reader(OneWriteReader, address=address, new_value=value,
-                                 newer_command_waiting=lambda: self.commands.has_pending)
+                                 newer_command_waiting=lambda: self.commands.has_pending,
+                                 tcp_readback=tcp_soc)
         async with self.ble_session_lock:
             try:
                 result = await reader.read(only_registers=[ReadableRegisters(address, 1)], raw=True)
@@ -1075,7 +1089,16 @@ class Bridge:
         if result is None or not reader.response_ok:
             LOG.error("Write unconfirmed: %s=%s", field, payload)
             return
+        if tcp_soc and reader.verified_value != value:
+            # FC06 was acknowledged, not yet verified. Never publish the
+            # requested target as actual state or mark it verified early.
+            # Replace any older outstanding target for the same SOC register.
+            self.soc_tcp_pending[address] = (value, time.monotonic())
+            LOG.info("SOC FC06 ACK: %s=%d; waiting for independent Modbus read-back",
+                     field, value)
+            return
         if reader.verified_value == value:
+            self.soc_tcp_pending.pop(address, None)
             self.last_registers[address] = value
             # This has been read back from hardware, not optimistically
             # mirrored from the MQTT command.
@@ -1133,6 +1156,29 @@ class Bridge:
                 if not self.commands.has_pending:
                     self.pending_write.clear()
 
+    def reconcile_soc_tcp(self, data, sample_at):
+        """Confirm pending SOC FC06 only from a post-ACK hardware TCP read.
+
+        Never use the MQTT target, FC06 echo or a cached pre-ACK sample as proof.
+        """
+        for addr, field in ((3015, "battery_range_start"),
+                            (3016, "battery_range_end")):
+            pending = self.soc_tcp_pending.get(addr)
+            if pending is None:
+                continue
+            target, ack_at = pending
+            actual = data.get(field)
+            if actual == target and sample_at >= ack_at:
+                self.commands.mark_verified(addr, actual, sample_at)
+                self.soc_tcp_pending.pop(addr, None)
+                LOG.info("SOC Modbus TCP verified: %s=%d (%.1fs after BLE ACK)",
+                         field, actual, sample_at - ack_at)
+            elif sample_at - ack_at >= 20:
+                self.soc_tcp_pending.pop(addr, None)
+                LOG.warning("SOC Modbus TCP verification timeout: %s target=%d actual=%s; "
+                            "not confirmed (no automatic FC06 retry)",
+                            field, target, actual)
+
     async def modbus_polling(self):
         """Independent Modbus TCP telemetrics, no Modbus writes."""
         if not self.opts.modbus_host:
@@ -1151,6 +1197,7 @@ class Bridge:
                     recovered = self.modbus_failure_logged or not self.modbus_last_ok
                     self.modbus_last_ok = time.monotonic()
                     self.modbus_recent_fields = set(data)
+                    self.reconcile_soc_tcp(data, self.modbus_last_ok)
                     # Also maintain the BLE register cache used for safe SOC
                     # start/end validation; Modbus state is read from hardware.
                     if "battery_range_start" in data:

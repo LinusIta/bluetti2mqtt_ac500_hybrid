@@ -27,7 +27,7 @@ jobs:
           import yaml
           d=yaml.safe_load(Path("bluetti2mqtt_ac500_hybrid/config.yaml").read_text())
           assert d["slug"] == "bluetti2mqtt_ac500_hybrid"
-          assert d["version"] == "1.0.0-beta9"
+          assert d["version"] == "1.0.0-beta10"
           assert d["options"]["modbus_port"] == 502
           assert d["options"]["modbus_poll_sec"] >= 2
           assert d["options"]["poll_sec"] >= 15
