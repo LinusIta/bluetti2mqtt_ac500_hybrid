@@ -1,4 +1,4 @@
-# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta3)
+# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta4)
 
 **Experimental third Home Assistant add-on**, independent of:
 - Bluetti2MQTT Plus 3.0.3 (legacy);
@@ -55,13 +55,13 @@ guarantee is possible while the BLE session is busy.
 - The first BLE cold poll may occur before the first Modbus success. MQTT
   consumers must rely on their own staleness checks in case both transports fail.
 
-## v1.0.0-beta3 — MQTT command priority
+## v1.0.0-beta4 — MQTT command priority
 - Abort B300's noncritical 10-second settle wait when an MQTT command arrives; restore B300 selector before releasing the BLE session.
 - FC06 write echo followed by FC03 read-back **within the same encrypted connection**; publish the actual read-back state only if verified.
 - Command queue dispatch latency logged; unsuccessful read-back triggers a prompt full BLE recheck.
 - Modbus telemetry and normal BLE/B300 scheduling unchanged.
 
-## v1.0.0-beta3 — delayed FC06 state verification
+## v1.0.0-beta4 — delayed FC06 state verification
 - FC06 echo means acknowledged, not necessarily applied. The AC500 may keep
   returning the previous register value for several seconds.
 - Three bounded FC03 read-back attempts in the SAME encrypted BLE session;
@@ -71,3 +71,24 @@ guarantee is possible while the BLE session is busy.
 - If the target is still not observed, log the target and observed values as
   **pending**, then request the existing BLE polling reconciliation.
 - The command state is never set optimistically from the requested payload.
+
+## v1.0.0-beta4 — high-frequency MQTT setpoints
+
+The Home Assistant surplus automation **does not need to be throttled**. The
+bridge now maintains a bounded **last-value-wins mailbox per physical BLE
+register** (aliases coalesce by address):
+
+- Each new setpoint replaces any pending older setpoint for that same register.
+  Different registers remain distinct; their latest commands are dispatched in
+  arrival order. An active BLE operation is never force-cancelled.
+- Repeated events matching the in-flight target discard obsolete alternatives.
+- Setpoints read back successfully from hardware are deduplicated for 30 s;
+  a different value is never suppressed by this cache.
+- Pending commands older than 45 s are discarded instead of being executed
+  dangerously late after a 60-second BLE timeout. Repeated same-value events
+  refresh the request timestamp. A fresh command can always be queued.
+- The existing 120 s BLE telemetry timer is **not** a command timer; commands
+  continue to wake the BLE command worker as events arrive.
+
+If the device does not respond to encrypted BLE, no software can guarantee
+instant writes. The mailbox prevents a backlog while communication recovers.
