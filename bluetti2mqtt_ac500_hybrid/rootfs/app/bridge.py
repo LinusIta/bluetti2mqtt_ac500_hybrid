@@ -520,7 +520,10 @@ class PackPollingReader(DeviceReader):
                 except PackScanPreempted:
                     self.was_preempted = True
                     LOG.info("B300 slot %d paused to prioritize MQTT command", slot)
-                    raise
+                    # This is expected scheduling, not a BLE fault. Returning
+                    # after finally restores the selector without causing
+                    # DeviceReader to emit a misleading "Unknown error".
+                    break
                 except Exception as exc:
                     self.failed_slots.add(slot)
                     LOG.warning("B300 slot %d scan failed: %s", slot, exc)
