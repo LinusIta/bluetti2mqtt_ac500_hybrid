@@ -1210,6 +1210,14 @@ class Bridge:
             # keep commands prioritised by the existing pending_write gate.
             end = time.monotonic() + delay
             while not self.stop_event.is_set() and not self.refresh_requested.is_set():
+                if modbus_ok and not (
+                    self.modbus_last_ok and time.monotonic() - self.modbus_last_ok
+                    < max(15, self.opts.modbus_poll_sec * 3)
+                ):
+                    # Do not remain asleep for 10 minutes if Modbus dies:
+                    # immediately restart short-cadence BLE telemetry.
+                    LOG.warning("Modbus stale; resuming BLE telemetry fallback")
+                    break
                 remaining = end - time.monotonic()
                 if remaining <= 0:
                     break
