@@ -63,6 +63,9 @@ class FakeBridge:
         self.states = []
         self.stop_event = asyncio.Event()
         self.refresh_requested = asyncio.Event()
+        self.modbus_last_ok = time.monotonic()
+        self.opts = type("Options", (), {"modbus_poll_sec": 5})()
+        self.soc_tcp_pending = {}
 
     def publish(self, field, value):
         self.states.append((field, value))
@@ -170,6 +173,25 @@ class TestChargeSession(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(reader._async_send_command(ReadableRegisters(3019, 1)), other())
         self.assertEqual(reader.writes, [4])
         self.assertIn(3015, bridge.commands.pending)
+
+    async def test_soc_uses_same_authenticated_ampere_session(self):
+        bridge = FakeBridge()
+        bridge.last_registers[3015] = 100
+        bridge.commands.put(3019, "grid_charge_amps", "4", 4, time.monotonic())
+        bridge.commands.pop(time.monotonic())
+        bridge.commands.put(3015, "battery_range_start", "20", 20, time.monotonic())
+        reader = ChargeSessionReader(
+            bridge=bridge, first_field="grid_charge_amps", first_value=4)
+        # The fake 3019 hardware verification must not be affected by a
+        # different Modbus address written in the same encrypted session.
+        original = reader._async_send_command
+        await original(ReadableRegisters(3019, 1))
+        self.assertIn(3015, bridge.soc_tcp_pending)
+        self.assertEqual(bridge.soc_tcp_pending[3015][0], 20)
+        self.assertNotIn(3015, bridge.commands.pending)
+        self.assertEqual(reader.verified, 1)
+        self.assertEqual(bridge.commands.verified[3019][0], 4)
+        self.assertNotIn(3015, bridge.commands.verified)
 
     async def test_identical_inflight_setpoint_does_not_repeat_fc06(self):
         bridge = FakeBridge()
