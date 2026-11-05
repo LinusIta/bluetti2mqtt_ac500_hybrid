@@ -43,6 +43,26 @@ class TestMailbox(unittest.TestCase):
         box.finish(3016, 100)
         self.assertEqual(box.pop(3)[3], 90)
 
+    def test_charge_current_goes_first_even_if_soc_arrived_first(self):
+        box = CommandMailbox()
+        box.put(3016, "battery_range_end", "100", 100, 0)
+        box.put(3015, "battery_range_start", "20", 20, 0.01)
+        box.put(3019, "grid_charge_amps", "3", 3, 0.02)
+        self.assertEqual(box.pop(1)[0], 3019)
+        box.finish(3019, 3)
+        self.assertEqual(box.pop(2)[0], 3016)
+        box.finish(3016, 100)
+        self.assertEqual(box.pop(3)[0], 3015)
+
+    def test_latest_amps_preempt_older_pending_without_dropping_soc(self):
+        box = CommandMailbox()
+        box.put(3015, "battery_range_start", "20", 20, 0)
+        box.put(3019, "grid_charge_amps", "6", 6, 0.1)
+        box.put(3019, "grid_charge_amps", "3", 3, 0.2)
+        self.assertEqual(box.pop(1)[3], 3)
+        box.finish(3019, 3)
+        self.assertEqual(box.pop(2)[0], 3015)
+
     def test_expired_command_not_executed(self):
         box = CommandMailbox(max_age=45)
         box.put(3019, "grid_charge_amps", "8", 8, 0)
