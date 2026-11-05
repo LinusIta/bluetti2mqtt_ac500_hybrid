@@ -302,6 +302,7 @@ class ChargeSessionReader(DeviceReader):
     VERIFY_DELAY = 3.4
     VERIFY_RETRY = 1.0
     VERIFIED_IDLE_SECONDS = 2.0  # short reuse window after confirmed hardware state
+    SOC_PAIR_IDLE_SECONDS = 2.0  # accept later ampere setpoints after SOC-first ACK
 
     def __init__(self, *args, bridge, first_field, first_value, **kwargs):
         super().__init__(*args, **kwargs)
@@ -333,10 +334,16 @@ class ChargeSessionReader(DeviceReader):
         self.bridge.last_registers[3019] = observed
         self.bridge.publish("grid_charge_amps", observed)
         self.bridge.commands.mark_verified(3019, observed, time.monotonic())
-        field = self.first_field
-        target = self.first_value
+        field = "grid_charge_amps"
+        target = observed
         verify_due = None
         verified_at = None
+        soc_first = self.first_field in ("battery_range_start", "battery_range_end")
+        if soc_first:
+            # SOC was the first queued command. Keep this BLE connection
+            # available for a later 3019 request rather than closing it and
+            # forcing another ECDSA handshake.
+            verified_at = time.monotonic()
 
         async def issue_setpoint(new_field, new_value):
             nonlocal observed, field, target, verify_due, verified_at
@@ -411,9 +418,18 @@ class ChargeSessionReader(DeviceReader):
             finally:
                 self.bridge.commands.finish(address, soc_target)
 
-        await issue_setpoint(field, target)
-        LOG.info("BLE fast session ready: duration limit %.0fs, register 3019",
-                 self.SESSION_SECONDS)
+        if soc_first:
+            initial_address = 3015 if self.first_field == "battery_range_start" else 3016
+            LOG.info("BLE shared session SOC-first: %s=%d; accepting ampere FC06 "
+                     "on same encrypted connection", self.first_field, self.first_value)
+            await issue_soc_from_mailbox((
+                initial_address, self.first_field, str(self.first_value),
+                self.first_value, time.monotonic()))
+            verified_at = time.monotonic()
+        else:
+            await issue_setpoint(self.first_field, self.first_value)
+        LOG.info("BLE shared session ready: duration limit %.0fs, initial=%s",
+                 self.SESSION_SECONDS, self.first_field)
 
         while not self.bridge.stop_event.is_set():
             remaining = deadline - time.monotonic()
@@ -487,8 +503,9 @@ class ChargeSessionReader(DeviceReader):
             # Release BlueZ as soon as the last requested value is verified,
             # but permit another fresh setpoint during this short grace period.
             # Pending requests are always processed BEFORE the idle check.
+            idle = self.SOC_PAIR_IDLE_SECONDS if soc_first else self.VERIFIED_IDLE_SECONDS
             if (verify_due is None and verified_at is not None
-                    and time.monotonic() - verified_at >= self.VERIFIED_IDLE_SECONDS):
+                    and time.monotonic() - verified_at >= idle):
                 LOG.info("BLE fast session closing early: verified idle %.1fs",
                          time.monotonic() - verified_at)
                 break
@@ -1138,9 +1155,14 @@ class Bridge:
             LOG.error("Rejected command %r=%r: %s", field, payload, ex)
             return
         LOG.info("FC06 %s register=%d value=%d", field, address, value)
-        if address == 3019:
-            # Experimental fast path: one ECDSA handshake, many commands and
-            # read-backs. Other registers retain the beta5 isolated writer.
+        tcp_soc = (address in (3015, 3016) and bool(
+            self.modbus_last_ok and time.monotonic() - self.modbus_last_ok
+            < max(15, self.opts.modbus_poll_sec * 3)))
+        if address == 3019 or tcp_soc:
+            # Share one ECDSA-authenticated BLE session for both directions:
+            # ampere -> SOC and SOC -> ampere. SOC FC06 is independently
+            # verified by TCP; current 3019 retains its BLE hardware read-back.
+            # Other registers keep the previous isolated writer.
             reader = self.new_reader(ChargeSessionReader, bridge=self,
                                      first_field=field, first_value=value)
             async with self.ble_session_lock:
@@ -1150,12 +1172,10 @@ class Bridge:
                 finally:
                     await asyncio.sleep(2)
             if outcome is None:
-                LOG.error("BLE fast session failed; do not replay uncertain FC06")
+                LOG.error("BLE shared session failed; do not replay uncertain FC06")
             return
         started = time.monotonic()
-        tcp_soc = (address in (3015, 3016) and bool(
-            self.modbus_last_ok and time.monotonic() - self.modbus_last_ok
-            < max(15, self.opts.modbus_poll_sec * 3)))
+        # TCP unavailable: retain the separate BLE read-back fallback.
         reader = self.new_reader(OneWriteReader, address=address, new_value=value,
                                  newer_command_waiting=lambda: self.commands.has_pending,
                                  tcp_readback=tcp_soc)
