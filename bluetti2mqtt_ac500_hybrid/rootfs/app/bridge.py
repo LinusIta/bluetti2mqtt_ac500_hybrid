@@ -1336,8 +1336,33 @@ class Bridge:
             await reader.close()
 
     async def polling(self):
+        # Let TCP establish itself before starting a bulky BLE telemetry
+        # handshake at startup. The MQTT command worker remains fully active.
+        # If TCP is healthy, postpone only the first diagnostic BLE poll;
+        # never postpone FC06 controls. If TCP fails, resume normal BLE fallback.
+        if self.opts.modbus_host:
+            startup_deadline = time.monotonic() + 3.0
+            while (not self.stop_event.is_set()
+                   and not self.modbus_last_ok
+                   and time.monotonic() < startup_deadline):
+                await asyncio.sleep(0.1)
+            if self.modbus_last_ok and not self.stop_event.is_set():
+                initial_delay = max(600, self.opts.poll_sec)
+                LOG.info("Modbus healthy at startup; defer full BLE telemetry "
+                         "poll for %ds (MQTT BLE commands remain immediate)",
+                         initial_delay)
+                deadline = time.monotonic() + initial_delay
+                while (not self.stop_event.is_set()
+                       and not self.refresh_requested.is_set()
+                       and time.monotonic() < deadline):
+                    if (time.monotonic() - self.modbus_last_ok
+                            >= max(15, self.opts.modbus_poll_sec * 3)):
+                        LOG.warning("Modbus stale during startup; "
+                                    "starting BLE telemetry fallback")
+                        break
+                    await asyncio.sleep(min(1.0, deadline - time.monotonic()))
         # poll_sec is start-to-start, rather than an idle delay added after
-        # every BLE transaction.  An overlong transaction simply shifts the
+        # every BLE transaction. An overlong transaction simply shifts the
         # next poll; never overlap encrypted BLE sessions.
         while not self.stop_event.is_set():
             cycle_start = time.monotonic()
