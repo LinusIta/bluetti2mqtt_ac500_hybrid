@@ -172,11 +172,11 @@ class TestChargeSession(unittest.IsolatedAsyncioTestCase):
 
         async def other():
             await asyncio.sleep(0.06)
-            bridge.commands.put(3015, "battery_range_start", "100", 100, time.monotonic())
+            bridge.commands.put(3007, "ac_output_on", "1", 1, time.monotonic())
 
         await asyncio.gather(reader._async_send_command(ReadableRegisters(3019, 1)), other())
         self.assertEqual(reader.writes, [4])
-        self.assertIn(3015, bridge.commands.pending)
+        self.assertIn(3007, bridge.commands.pending)
 
     async def test_soc_uses_same_authenticated_ampere_session(self):
         bridge = FakeBridge()
