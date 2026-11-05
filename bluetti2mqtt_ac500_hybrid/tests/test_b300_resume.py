@@ -146,6 +146,7 @@ def load_bridge_scan_methods():
     env = {
         "ScanBridge": ScanBridge,
         "PackScanProgress": PackScanProgress,
+        "Any": __import__("typing").Any,
         "ReadableRegisters": FakeReadRegister,
         "PACK_SELECTOR": 3006,
         "PackPollingReader": object,
