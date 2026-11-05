@@ -222,13 +222,16 @@ class Settings:
 
 class OneWriteReader(DeviceReader):
     """Execute exactly one FC06 from a read session; check returned Modbus echo."""
-    def __init__(self, *args, address: int, new_value: int, **kwargs):
+    def __init__(self, *args, address: int, new_value: int, newer_command_waiting=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.address = address
         self.new_value = new_value
         self.response_ok = False
         self.previous_value = None
         self.verified_value = None
+        self.newer_command_waiting = newer_command_waiting or (lambda: False)
+        self.readback_attempts = 0
+        self.readback_superseded = False
 
     async def _async_send_command(self, register):
         original = await super()._async_send_command(register)
@@ -245,17 +248,30 @@ class OneWriteReader(DeviceReader):
         self.response_ok = bytes(reply) == bytes(write)
         if not self.response_ok:
             raise RuntimeError("FC06 echo mismatch or missing (write outcome unknown)")
-        # Try a cheap FC03 read-back in this SAME authenticated session.
-        # A delayed device write may still return the old value; do not claim
-        # it succeeded unless the register actually reports the target value.
-        try:
-            verify_register = ReadableRegisters(self.address, 1)
-            verified = await super()._async_send_command(verify_register)
-            data = verify_register.parse_response(verified)
-            if len(data) == 2:
-                self.verified_value = int.from_bytes(data, "big")
-        except Exception as exc:
-            LOG.warning("FC06 read-back unavailable for register %d: %s", self.address, exc)
+        # AC500 can acknowledge FC06 before the new value becomes visible in
+        # FC03. Verify up to three times in this *same* BLE session, without
+        # issuing another write. Do not delay a newer queued MQTT command.
+        for attempt, pause in enumerate((0.0, 0.75, 1.5), start=1):
+            if self.newer_command_waiting():
+                self.readback_superseded = True
+                break
+            if pause:
+                await asyncio.sleep(pause)
+                if self.newer_command_waiting():
+                    self.readback_superseded = True
+                    break
+            try:
+                verify_register = ReadableRegisters(self.address, 1)
+                verified = await super()._async_send_command(verify_register)
+                data = verify_register.parse_response(verified)
+                self.readback_attempts += 1
+                if len(data) == 2:
+                    self.verified_value = int.from_bytes(data, "big")
+                    if self.verified_value == self.new_value:
+                        break
+            except Exception as exc:
+                LOG.warning("FC06 read-back unavailable for register %d: %s", self.address, exc)
+                break
         return original
 
 # AC500 B300 pack selector and data block, verified against the actual AC500.
@@ -794,7 +810,8 @@ class Bridge:
             return
         LOG.info("FC06 %s register=%d value=%d", field, address, value)
         started = time.monotonic()
-        reader = self.new_reader(OneWriteReader, address=address, new_value=value)
+        reader = self.new_reader(OneWriteReader, address=address, new_value=value,
+                                 newer_command_waiting=lambda: not self.queue.empty())
         async with self.ble_session_lock:
             try:
                 result = await reader.read(only_registers=[ReadableRegisters(address, 1)], raw=True)
@@ -811,10 +828,17 @@ class Bridge:
             LOG.info("FC06 verified: %s=%s (%.1fs from writer start)",
                      field, payload, time.monotonic() - started)
         else:
-            LOG.warning("FC06 accepted but not yet verified: %s=%s, read-back=%s",
-                        field, payload, reader.verified_value)
-            self.refresh_requested.set()
-        # Only schedule a full BLE refresh when a direct read-back is inconclusive.
+            # FC06 echo is transport acknowledgement, not proof that the
+            # firmware has already applied the new value. An older target may
+            # legitimately appear during the asynchronous register update.
+            LOG.warning("FC06 acknowledged, hardware read-back pending: "
+                        "%s target=%s observed=%s attempts=%d superseded=%s",
+                        field, payload, reader.verified_value,
+                        reader.readback_attempts, reader.readback_superseded)
+            if not reader.readback_superseded:
+                self.refresh_requested.set()
+        # Do not retry the write automatically: a duplicate or old command can
+        # override a newer operator request. Next BLE polling reconciles state.
 
     async def worker(self):
         while not self.stop_event.is_set():
