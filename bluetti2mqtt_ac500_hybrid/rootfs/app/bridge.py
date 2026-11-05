@@ -1092,7 +1092,18 @@ class Bridge:
                         field, payload, reader.verified_value,
                         reader.readback_attempts, reader.readback_superseded)
             if not reader.readback_superseded:
-                self.refresh_requested.set()
+                modbus_ok = bool(
+                    self.modbus_last_ok
+                    and time.monotonic() - self.modbus_last_ok
+                    < max(15, self.opts.modbus_poll_sec * 3)
+                )
+                if address in (3015, 3016) and modbus_ok:
+                    # 57016/57017 provide independent live hardware SOC
+                    # config state. Let the 5s TCP poll observe convergence,
+                    # instead of forcing another full 29-block BLE session.
+                    LOG.info("SOC FC06 ACK; awaiting Modbus TCP threshold state")
+                else:
+                    self.refresh_requested.set()
         # Do not retry the write automatically: a duplicate or old command can
         # override a newer operator request. Next BLE polling reconciles state.
 
