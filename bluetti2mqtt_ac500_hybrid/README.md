@@ -194,10 +194,17 @@ A new add-on option `pack_poll_enabled: false` disables periodic encrypted
 B300 scans by default; set it to `true` to restore the beta8 resumable pack
 scan behaviour. Previously published pack state topics are not deleted or
 zeroed, but their values will become stale while pack polling is disabled.
+For a **one-shot** B300 scan with automatic scanning disabled, publish
+payload `SCAN` (not retained) on
+`bluetti/command/AC500-<serial>/scan_b300`. MQTT write commands retain
+priority and an interrupted one-shot scan resumes until finished. This
+request does not change any Home Assistant entity or enable automatic scans.
 The 600s BLE diagnostic refresh is distinct from B300 scans. The Modbus TCP
 client remains one persistent connection per add-on instance.
 
 The correlation between Modbus SOC thresholds and Bluetooth FC06 settings
 should be validated on the user's AC500 firmware before replacing the BLE
 read-back of SOC writes. The beta9 design leaves the verified BLE writer
-unchanged for this reason.
+unchanged, but relies on the next Modbus poll to reflect an FC06 ACK that
+still reports an old SOC limit immediately after the write (avoiding an
+additional full BLE poll). If TCP fails, the previous BLE fallback remains.
