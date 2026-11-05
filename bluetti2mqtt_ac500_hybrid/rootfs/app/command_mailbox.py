@@ -49,7 +49,14 @@ class CommandMailbox:
 
     def pop(self, now):
         while self.pending:
-            address, (field, payload, numeric, received_at) = self.pending.popitem(last=False)
+            # Charging current is the time-critical surplus control. When
+            # multiple MQTT commands arrive together, run 3019 before SOC
+            # configuration; an already active FC06 is never interrupted.
+            if 3019 in self.pending:
+                address = 3019
+                field, payload, numeric, received_at = self.pending.pop(address)
+            else:
+                address, (field, payload, numeric, received_at) = self.pending.popitem(last=False)
             if now - received_at > self.max_age:
                 # Never execute an obsolete command after a long BLE timeout.
                 LOG.warning("Expired MQTT setpoint %s=%s (%.1fs queued); not sent to BLE",
