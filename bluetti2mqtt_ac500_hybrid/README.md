@@ -1,4 +1,4 @@
-# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta4)
+# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta5)
 
 **Experimental third Home Assistant add-on**, independent of:
 - Bluetti2MQTT Plus 3.0.3 (legacy);
@@ -55,13 +55,13 @@ guarantee is possible while the BLE session is busy.
 - The first BLE cold poll may occur before the first Modbus success. MQTT
   consumers must rely on their own staleness checks in case both transports fail.
 
-## v1.0.0-beta4 — MQTT command priority
+## v1.0.0-beta5 — MQTT command priority
 - Abort B300's noncritical 10-second settle wait when an MQTT command arrives; restore B300 selector before releasing the BLE session.
 - FC06 write echo followed by FC03 read-back **within the same encrypted connection**; publish the actual read-back state only if verified.
 - Command queue dispatch latency logged; unsuccessful read-back triggers a prompt full BLE recheck.
 - Modbus telemetry and normal BLE/B300 scheduling unchanged.
 
-## v1.0.0-beta4 — delayed FC06 state verification
+## v1.0.0-beta5 — delayed FC06 state verification
 - FC06 echo means acknowledged, not necessarily applied. The AC500 may keep
   returning the previous register value for several seconds.
 - Three bounded FC03 read-back attempts in the SAME encrypted BLE session;
@@ -72,7 +72,7 @@ guarantee is possible while the BLE session is busy.
   **pending**, then request the existing BLE polling reconciliation.
 - The command state is never set optimistically from the requested payload.
 
-## v1.0.0-beta4 — high-frequency MQTT setpoints
+## v1.0.0-beta5 — high-frequency MQTT setpoints
 
 The Home Assistant surplus automation **does not need to be throttled**. The
 bridge now maintains a bounded **last-value-wins mailbox per physical BLE
@@ -92,3 +92,22 @@ register** (aliases coalesce by address):
 
 If the device does not respond to encrypted BLE, no software can guarantee
 instant writes. The mailbox prevents a backlog while communication recovers.
+
+## v1.0.0-beta5 — faster charge-current state reconciliation
+
+The AC500 commonly acknowledges FC06 before its register 3019 reports the
+new charge-current value. Repeated FC03 verification within a single BLE
+session holds the Bluetooth lock but often observes the old value.
+
+- Attempt at most one immediate FC03 read-back after FC06; **never repeat
+  FC06** just to verify it.
+- If not yet verified, request the normal BLE poll promptly after releasing
+  the encrypted session. The poll publishes the **actual** register 3019 value
+  to Home Assistant and logs `BLE hardware grid_charge_amps=<n> A`.
+- Keep beta4 last-value-wins mailbox, physical B300 scan preemption, and
+  independent Modbus TCP polling unchanged.
+- Do not publish requested charge current as confirmed hardware state before
+  the register is actually observed.
+
+Actual update latency is limited by the AC500 BLE handshake, firmware and
+hardware settling time; no instantaneous acknowledgement is assumed.
