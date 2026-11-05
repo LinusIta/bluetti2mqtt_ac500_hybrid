@@ -297,7 +297,7 @@ class ChargeSessionReader(DeviceReader):
         self.bridge = bridge
         self.first_field = first_field
         self.first_value = first_value
-        self.writes = 0
+        self.write_count = 0
         self.verified = 0
         self.first_ack = False
 
@@ -341,7 +341,7 @@ class ChargeSessionReader(DeviceReader):
             echo = await super(ChargeSessionReader, self)._async_send_command(write)
             if bytes(echo) != bytes(write):
                 raise RuntimeError("AC500 FC06 echo missing/mismatched (outcome uncertain)")
-            self.writes += 1
+            self.write_count += 1
             self.first_ack = True
             # Any prior hardware sample is now stale until the new target is
             # observed. Never deduplicate based on a pre-FC06 value.
@@ -408,7 +408,7 @@ class ChargeSessionReader(DeviceReader):
 
         LOG.info("BLE fast session complete: %.1fs, writes=%d, verified=%d, "
                  "last_target=%d, last_observed=%d",
-                 time.monotonic() - started, self.writes, self.verified,
+                 time.monotonic() - started, self.write_count, self.verified,
                  target, observed)
         # A normal poll can resolve a late hardware application. Do not retry
         # FC06 automatically because a newer command might already supersede it.
