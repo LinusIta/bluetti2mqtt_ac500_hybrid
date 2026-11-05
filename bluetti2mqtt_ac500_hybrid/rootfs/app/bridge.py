@@ -288,7 +288,7 @@ class ChargeSessionReader(DeviceReader):
     owns only register 3019; other controls keep the proven beta5 path.
     """
 
-    SESSION_SECONDS = 18.0
+    SESSION_SECONDS = 21.0
     VERIFY_DELAY = 3.4
     VERIFY_RETRY = 1.0
 
@@ -358,7 +358,7 @@ class ChargeSessionReader(DeviceReader):
         while not self.bridge.stop_event.is_set():
             remaining = deadline - time.monotonic()
             # Leave time for cleanup before the observed BLE disconnection.
-            if remaining <= 1.5 or not self.client or not self.client.is_connected:
+            if remaining <= 1.0 or not self.client or not self.client.is_connected:
                 break
 
             # Other control registers (SOC, UPS, etc.) take priority over
@@ -404,7 +404,7 @@ class ChargeSessionReader(DeviceReader):
                     verify_due = time.monotonic() + self.VERIFY_RETRY
                 continue
 
-            await asyncio.sleep(min(0.15, max(0.01, remaining - 1.5)))
+            await asyncio.sleep(min(0.15, max(0.01, remaining - 1.0)))
 
         LOG.info("BLE fast session complete: %.1fs, writes=%d, verified=%d, "
                  "last_target=%d, last_observed=%d",
