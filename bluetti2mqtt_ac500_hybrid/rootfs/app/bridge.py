@@ -635,6 +635,22 @@ class Bridge:
         except (KeyError, ValueError) as exc:
             LOG.warning("Rejected MQTT command %r=%r: %s", field, value, exc)
             return
+        # Modbus is an independent live hardware read for the SOC thresholds.
+        # Do not open an expensive BLE handshake for a no-op SOC command.
+        # Never suppress a newer command while an older one is in flight,
+        # queued, or waiting for post-FC06 Modbus verification.
+        if (address in (3015, 3016)
+                and self.modbus_last_ok
+                and time.monotonic() - self.modbus_last_ok
+                < max(15, self.opts.modbus_poll_sec * 3)
+                and address not in self.soc_tcp_pending
+                and address not in self.commands.pending
+                and not (self.commands.active and self.commands.active[0] == address)
+                and self.last_registers.get(address) == numeric):
+            self.commands.mark_verified(address, numeric, time.monotonic())
+            LOG.info("SOC command %s=%d already confirmed by fresh Modbus state; "
+                     "skipping redundant BLE FC06 session", field, numeric)
+            return
         outcome = self.commands.put(address, field, value, numeric, time.monotonic())
         if outcome in ("queued", "replaced"):
             self.pending_write.set()
