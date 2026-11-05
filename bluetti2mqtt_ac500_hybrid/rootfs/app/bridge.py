@@ -1213,6 +1213,17 @@ class Bridge:
             await self.pending_write.wait()
             if self.stop_event.is_set():
                 break
+            # MQTT events from one HA automation arrive on separate topics.
+            # Give a SOC-only queue a tiny coalescing window so the matching
+            # time-critical ampere command can be dispatched FIRST, then
+            # piggyback SOC FC06 on the same authenticated BLE session.
+            # Never delay an already queued ampere command.
+            if (self.commands.pending
+                    and all(a in (3015, 3016) for a in self.commands.pending)
+                    and self.modbus_last_ok
+                    and time.monotonic() - self.modbus_last_ok
+                    < max(15, self.opts.modbus_poll_sec * 3)):
+                await asyncio.sleep(0.20)
             command = self.commands.pop(time.monotonic())
             if command is None:
                 self.pending_write.clear()
