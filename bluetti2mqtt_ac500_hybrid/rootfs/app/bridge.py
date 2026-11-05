@@ -194,6 +194,7 @@ class Settings:
     allow_writes: bool
     pack_poll_sec: int
     pack_scan_sec: int
+    pack_poll_enabled: bool
     modbus_host: str
     modbus_port: int
     modbus_poll_sec: int
@@ -217,6 +218,7 @@ class Settings:
             allow_writes=bool(data.get("allow_writes", False)),
             pack_poll_sec=max(90, int(data.get("pack_poll_sec", 600))),
             pack_scan_sec=max(600, int(data.get("pack_scan_sec", 3600))),
+            pack_poll_enabled=bool(data.get("pack_poll_enabled", False)),
             modbus_host=str(data.get("modbus_host", "")).strip(),
             modbus_port=int(data.get("modbus_port", 502)),
             modbus_poll_sec=max(2, int(data.get("modbus_poll_sec", 5))),
@@ -844,6 +846,11 @@ class Bridge:
                      sorted(progress.failures), self.pack_resume_delay)
 
     async def pack_polling(self):
+        # B300 diagnostics are optional: disabled by default to reserve BLE
+        # exclusively for surplus setpoints and control read-back.
+        if not self.opts.pack_poll_enabled:
+            LOG.info("B300 automatic BLE scanning disabled (pack_poll_enabled=false)")
+            return
         # Let main AC500 polling establish the first encrypted session.
         try:
             await asyncio.wait_for(self.stop_event.wait(), timeout=120)
@@ -1102,6 +1109,12 @@ class Bridge:
                     recovered = self.modbus_failure_logged or not self.modbus_last_ok
                     self.modbus_last_ok = time.monotonic()
                     self.modbus_recent_fields = set(data)
+                    # Also maintain the BLE register cache used for safe SOC
+                    # start/end validation; Modbus state is read from hardware.
+                    if "battery_range_start" in data:
+                        self.last_registers[3015] = data["battery_range_start"]
+                    if "battery_range_end" in data:
+                        self.last_registers[3016] = data["battery_range_end"]
                     self.modbus_failure_logged = False
                     self.modbus_publishing = True
                     try:
@@ -1146,7 +1159,10 @@ class Bridge:
             # loop of repeated BLE handshakes.
             # Fail back to the old ~15-second BLE cadence while Modbus is down.
             modbus_ok = bool(self.modbus_last_ok and time.monotonic() - self.modbus_last_ok < max(15, self.opts.modbus_poll_sec * 3))
-            interval = self.opts.poll_sec if modbus_ok else 15
+            # When Modbus is healthy, periodic full BLE telemetry is a rare
+            # diagnostic refresh. FC06 writes and explicit read-back wakeups
+            # still run immediately, irrespective of this interval.
+            interval = max(600, self.opts.poll_sec) if modbus_ok else 15
             delay = max(2.0 if failed else 0.0, interval - elapsed)
             # Wake a periodic BLE reader promptly for command read-back;
             # keep commands prioritised by the existing pending_write gate.
