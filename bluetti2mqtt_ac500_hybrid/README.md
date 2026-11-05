@@ -1,4 +1,4 @@
-# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta5)
+# Bluetti2MQTT Plus - AC500 Hybrid (v1.0.0-beta6)
 
 **Experimental third Home Assistant add-on**, independent of:
 - Bluetti2MQTT Plus 3.0.3 (legacy);
@@ -55,13 +55,13 @@ guarantee is possible while the BLE session is busy.
 - The first BLE cold poll may occur before the first Modbus success. MQTT
   consumers must rely on their own staleness checks in case both transports fail.
 
-## v1.0.0-beta5 — MQTT command priority
+## v1.0.0-beta6 — MQTT command priority
 - Abort B300's noncritical 10-second settle wait when an MQTT command arrives; restore B300 selector before releasing the BLE session.
 - FC06 write echo followed by FC03 read-back **within the same encrypted connection**; publish the actual read-back state only if verified.
 - Command queue dispatch latency logged; unsuccessful read-back triggers a prompt full BLE recheck.
 - Modbus telemetry and normal BLE/B300 scheduling unchanged.
 
-## v1.0.0-beta5 — delayed FC06 state verification
+## v1.0.0-beta6 — delayed FC06 state verification
 - FC06 echo means acknowledged, not necessarily applied. The AC500 may keep
   returning the previous register value for several seconds.
 - Three bounded FC03 read-back attempts in the SAME encrypted BLE session;
@@ -72,7 +72,7 @@ guarantee is possible while the BLE session is busy.
   **pending**, then request the existing BLE polling reconciliation.
 - The command state is never set optimistically from the requested payload.
 
-## v1.0.0-beta5 — high-frequency MQTT setpoints
+## v1.0.0-beta6 — high-frequency MQTT setpoints
 
 The Home Assistant surplus automation **does not need to be throttled**. The
 bridge now maintains a bounded **last-value-wins mailbox per physical BLE
@@ -93,7 +93,7 @@ register** (aliases coalesce by address):
 If the device does not respond to encrypted BLE, no software can guarantee
 instant writes. The mailbox prevents a backlog while communication recovers.
 
-## v1.0.0-beta5 — faster charge-current state reconciliation
+## v1.0.0-beta6 — faster charge-current state reconciliation
 
 The AC500 commonly acknowledges FC06 before its register 3019 reports the
 new charge-current value. Repeated FC03 verification within a single BLE
@@ -111,3 +111,31 @@ session holds the Bluetooth lock but often observes the old value.
 
 Actual update latency is limited by the AC500 BLE handshake, firmware and
 hardware settling time; no instantaneous acknowledgement is assumed.
+
+## v1.0.0-beta6 — experimental fast encrypted charge-current session
+
+Verified on AC500: ECDSA handshake can be reused for repeated FC03 and a
+FC03→FC06→FC03 sequence. Register 3019 becomes readable roughly 4 seconds
+following an FC06 ACK; longer sessions disconnected around 25 seconds after
+the first read. This release introduces a **bounded 18-second BLE session
+for grid_charge_amps (3019) only**:
+
+- One encrypted handshake per session; FC06 updates arriving while open reuse
+  the connection and inherit beta4 Last Value Wins MQTT coalescing.
+- Read-back is scheduled 3.4 s after FC06 ACK, with 1 s read retries only
+  while that same authenticated session remains connected. Home Assistant
+  receives the **actual** value observed, never an optimistic MQTT target.
+- New 3019 setpoints supersede pending verification of older ones. Requests
+  targeting other registers cause the session to yield promptly so SOC and
+  UPS controls keep their previous beta5 writer and are not starved.
+- The session ends voluntarily at or before 18 s after its first FC03,
+  safely short of the reproducible disconnect observed near 25 s. New
+  commands arriving later start a new session. Modbus TCP remains independent;
+  B300 polling retains its existing isolated-session behavior.
+- A failed or ambiguous FC06 is never blindly retried. The next command or
+  normal BLE poll reconciles actual state. Existing entity IDs and add-on
+  options are unchanged.
+
+This is an experimental change. Keep the Secure BLE 4.0.2 add-on stopped while
+Hybrid is running. Use logs `BLE fast session` and `BLE fast session hardware`
+for timing analysis.
