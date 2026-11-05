@@ -343,6 +343,9 @@ class ChargeSessionReader(DeviceReader):
                 raise RuntimeError("AC500 FC06 echo missing/mismatched (outcome uncertain)")
             self.writes += 1
             self.first_ack = True
+            # Any prior hardware sample is now stale until the new target is
+            # observed. Never deduplicate based on a pre-FC06 value.
+            self.bridge.commands.verified.pop(3019, None)
             verify_due = time.monotonic() + self.VERIFY_DELAY
             LOG.info("BLE session FC06 ACK: grid_charge_amps=%d A; "
                      "read-back scheduled (%.2fs into session)",
@@ -389,7 +392,8 @@ class ChargeSessionReader(DeviceReader):
                 observed = await self._read_amps()
                 self.bridge.last_registers[3019] = observed
                 self.bridge.publish("grid_charge_amps", observed)
-                self.bridge.commands.mark_verified(3019, observed, time.monotonic())
+                if observed == target:
+                    self.bridge.commands.mark_verified(3019, observed, time.monotonic())
                 LOG.info("BLE fast session hardware grid_charge_amps=%d A "
                          "(requested=%d A, +%.1fs)", observed, target,
                          time.monotonic() - started)
