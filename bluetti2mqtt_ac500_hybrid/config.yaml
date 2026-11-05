@@ -1,5 +1,5 @@
 name: "Bluetti2MQTT Plus - AC500 Hybrid"
-version: "1.0.0-beta6"
+version: "1.0.0-beta7"
 stage: experimental
 slug: bluetti2mqtt_ac500_hybrid
 description: "AC500 Modbus TCP telemetry + encrypted BLE packs and commands (beta)"

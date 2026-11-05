@@ -291,6 +291,7 @@ class ChargeSessionReader(DeviceReader):
     SESSION_SECONDS = 21.0
     VERIFY_DELAY = 3.4
     VERIFY_RETRY = 1.0
+    VERIFIED_IDLE_SECONDS = 2.0  # short reuse window after confirmed hardware state
 
     def __init__(self, *args, bridge, first_field, first_value, **kwargs):
         super().__init__(*args, **kwargs)
@@ -325,10 +326,12 @@ class ChargeSessionReader(DeviceReader):
         field = self.first_field
         target = self.first_value
         verify_due = None
+        verified_at = None
 
         async def issue_setpoint(new_field, new_value):
-            nonlocal observed, field, target, verify_due
+            nonlocal observed, field, target, verify_due, verified_at
             field, target = new_field, new_value
+            verified_at = None
             # A read result is actual hardware evidence; never publish an
             # optimistic MQTT state on FC06 echo alone.
             if observed == target:
@@ -336,6 +339,7 @@ class ChargeSessionReader(DeviceReader):
                 self.bridge.publish("grid_charge_amps", target)
                 LOG.info("BLE session 3019 already at %d A", target)
                 verify_due = None
+                verified_at = time.monotonic()
                 return
             write = WriteableRegister(3019, target)
             echo = await super(ChargeSessionReader, self)._async_send_command(write)
@@ -346,6 +350,9 @@ class ChargeSessionReader(DeviceReader):
             # Any prior hardware sample is now stale until the new target is
             # observed. Never deduplicate based on a pre-FC06 value.
             self.bridge.commands.verified.pop(3019, None)
+            # The last FC03 sample predates FC06. It is NOT reliable evidence
+            # for deduplicating a subsequent setpoint until we read again.
+            observed = None
             verify_due = time.monotonic() + self.VERIFY_DELAY
             LOG.info("BLE session FC06 ACK: grid_charge_amps=%d A; "
                      "read-back scheduled (%.2fs into session)",
@@ -400,14 +407,24 @@ class ChargeSessionReader(DeviceReader):
                 if observed == target:
                     self.verified += 1
                     verify_due = None
+                    verified_at = time.monotonic()
                 else:
                     verify_due = time.monotonic() + self.VERIFY_RETRY
                 continue
 
+            # Release BlueZ as soon as the last requested value is verified,
+            # but permit another fresh setpoint during this short grace period.
+            # Pending requests are always processed BEFORE the idle check.
+            if (verify_due is None and verified_at is not None
+                    and time.monotonic() - verified_at >= self.VERIFIED_IDLE_SECONDS):
+                LOG.info("BLE fast session closing early: verified idle %.1fs",
+                         time.monotonic() - verified_at)
+                break
+
             await asyncio.sleep(min(0.15, max(0.01, remaining - 1.0)))
 
         LOG.info("BLE fast session complete: %.1fs, writes=%d, verified=%d, "
-                 "last_target=%d, last_observed=%d",
+                 "last_target=%d, last_observed=%s",
                  time.monotonic() - started, self.write_count, self.verified,
                  target, observed)
         # A normal poll can resolve a late hardware application. Do not retry
