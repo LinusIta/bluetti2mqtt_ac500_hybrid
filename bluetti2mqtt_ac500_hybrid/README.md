@@ -117,7 +117,7 @@ hardware settling time; no instantaneous acknowledgement is assumed.
 Verified on AC500: ECDSA handshake can be reused for repeated FC03 and a
 FC03→FC06→FC03 sequence. Register 3019 becomes readable roughly 4 seconds
 following an FC06 ACK; longer sessions disconnected around 25 seconds after
-the first read. This release introduces a **bounded 18-second BLE session
+the first read. This release introduces a **bounded 21-second BLE session
 for grid_charge_amps (3019) only**:
 
 - One encrypted handshake per session; FC06 updates arriving while open reuse
@@ -128,7 +128,7 @@ for grid_charge_amps (3019) only**:
 - New 3019 setpoints supersede pending verification of older ones. Requests
   targeting other registers cause the session to yield promptly so SOC and
   UPS controls keep their previous beta5 writer and are not starved.
-- The session ends voluntarily at or before 18 s after its first FC03,
+- The session ends voluntarily at or before 21 s after its first FC03,
   safely short of the reproducible disconnect observed near 25 s. New
   commands arriving later start a new session. Modbus TCP remains independent;
   B300 polling retains its existing isolated-session behavior.
