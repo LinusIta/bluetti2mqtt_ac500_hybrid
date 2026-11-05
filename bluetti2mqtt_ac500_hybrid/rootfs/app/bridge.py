@@ -368,6 +368,49 @@ class ChargeSessionReader(DeviceReader):
                      "read-back scheduled (%.2fs into session)",
                      target, time.monotonic() - started)
 
+        async def issue_soc_from_mailbox(command):
+            """Piggyback one queued SOC FC06 on active encrypted BLE session.
+
+            FC06 echo is not a verified state: independently reconcile
+            through the existing read-only TCP loop after the ACK.
+            """
+            address, soc_field, _, soc_target, received_at = command
+            try:
+                now = time.monotonic()
+                if now - received_at > self.bridge.commands.max_age:
+                    LOG.warning("Expired piggyback SOC command %s=%d", soc_field, soc_target)
+                    return
+                # Don't trust an old hardware reading, or skip a pending
+                # target that has not yet been confirmed after its FC06.
+                current = self.bridge.last_registers.get(address)
+                fresh_tcp = bool(
+                    self.bridge.modbus_last_ok
+                    and now - self.bridge.modbus_last_ok
+                    < max(15, self.bridge.opts.modbus_poll_sec * 3)
+                )
+                if not fresh_tcp:
+                    LOG.warning("SOC piggyback skipped: TCP stale, separate BLE "
+                                "write/read-back needed")
+                    self.bridge.commands.pending[address] = (
+                        soc_field, str(soc_target), soc_target, received_at)
+                    return
+                if (current == soc_target
+                        and address not in self.bridge.soc_tcp_pending):
+                    self.bridge.commands.mark_verified(address, soc_target, now)
+                    LOG.info("SOC piggyback %s=%d already at target (fresh Modbus)",
+                             soc_field, soc_target)
+                    return
+                write = WriteableRegister(address, soc_target)
+                echo = await super(ChargeSessionReader, self)._async_send_command(write)
+                if bytes(echo) != bytes(write):
+                    raise RuntimeError(f"SOC piggyback FC06 echo mismatch at {address}")
+                self.bridge.soc_tcp_pending[address] = (soc_target, time.monotonic())
+                self.write_count += 1
+                LOG.info("SOC piggyback FC06 ACK: %s=%d; independent TCP read-back pending",
+                         soc_field, soc_target)
+            finally:
+                self.bridge.commands.finish(address, soc_target)
+
         await issue_setpoint(field, target)
         LOG.info("BLE fast session ready: duration limit %.0fs, register 3019",
                  self.SESSION_SECONDS)
@@ -378,9 +421,28 @@ class ChargeSessionReader(DeviceReader):
             if remaining <= 1.0 or not self.client or not self.client.is_connected:
                 break
 
-            # Other control registers (SOC, UPS, etc.) take priority over
-            # keeping the 3019 session alive. Never consume their commands.
-            if any(address != 3019 for address in self.bridge.commands.pending):
+            # A freshly queued 3019 remains highest priority. SOC thresholds
+            # may share this exact authenticated session, without a second
+            # handshake or waiting for charge-current hardware verification.
+            # All other controls retain their isolated tested BLE writer.
+            if (3019 not in self.bridge.commands.pending
+                    and any(a in (3015, 3016) for a in self.bridge.commands.pending)):
+                if not (self.bridge.modbus_last_ok
+                        and time.monotonic() - self.bridge.modbus_last_ok
+                        < max(15, self.bridge.opts.modbus_poll_sec * 3)):
+                    LOG.info("BLE fast session yielding SOC controls to BLE fallback")
+                    break
+                # CommandMailbox.pop prioritizes 3019, but only SOCs remain
+                # in this branch. Other controls still wait for their worker.
+                soc_address = next(a for a in self.bridge.commands.pending
+                                   if a in (3015, 3016))
+                pending = self.bridge.commands.pending.pop(soc_address)
+                self.bridge.commands.active = (soc_address, pending[2])
+                await issue_soc_from_mailbox((
+                    soc_address, pending[0], pending[1], pending[2], pending[3]))
+                continue
+            if any(a not in (3019, 3015, 3016)
+                   for a in self.bridge.commands.pending):
                 LOG.info("BLE fast session yielding to another control register")
                 break
 
