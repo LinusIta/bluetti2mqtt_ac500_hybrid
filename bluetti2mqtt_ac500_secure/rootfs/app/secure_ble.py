@@ -29,27 +29,40 @@ class SecureBLE:
     def __init__(self, mac):
         from bluetti_crypt import BluettiCrypt
         self.mac = mac
-        self.crypt = BluettiCrypt.get_instance()
+        # Use a fresh native crypto context for each BLE ECDH session.
+        self.crypt_type = BluettiCrypt
+        self.crypt = None
         self.client = None
+        self.generation = 0
         self.queue = asyncio.Queue()
         self.lock = asyncio.Lock()
         self.authenticated = False
         self.connected_at = 0
 
-    def _notification(self, _sender, data):
-        self.queue.put_nowait(bytes(data))
+    def _notification(self, generation, _sender, data):
+        # Ignore late packets from closed connections.
+        if generation == self.generation:
+            self.queue.put_nowait(bytes(data))
 
     async def close(self):
-        if self.client:
-            try:
-                if self.client.is_connected:
-                    await self.client.stop_notify(RX)
-                    await self.client.disconnect()
-            except Exception:
-                LOG.debug("BLE disconnection error", exc_info=True)
+        self.generation += 1
+        client = self.client
         self.client = None
         self.authenticated = False
+        self.connected_at = 0
         self.queue = asyncio.Queue()
+        if client:
+            try:
+                if client.is_connected:
+                    await client.stop_notify(RX)
+            except Exception:
+                LOG.debug("BLE stop_notify error", exc_info=True)
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:
+                LOG.debug("BLE disconnect error", exc_info=True)
+        self.crypt = None
 
     async def _send(self, frame):
         encrypted = self.crypt.encrypt_data(frame)
@@ -62,12 +75,17 @@ class SecureBLE:
                 and time.monotonic() - self.connected_at < 18):
             return
         await self.close()
+        # Reinitialize authorized crypto state, including ephemeral AES keys.
+        self.crypt = self.crypt_type()
+        generation = self.generation
         self.client = BleakClient(self.mac, timeout=25)
-        await self.client.connect()
-        await self.client.start_notify(RX, self._notification)
         sent_serial = False
         deadline = time.monotonic() + 60
         try:
+            await self.client.connect()
+            await self.client.start_notify(
+                RX, lambda sender, data: self._notification(generation, sender, data)
+            )
             for _ in range(25):
                 remaining = min(15, deadline - time.monotonic())
                 if remaining <= 0:
@@ -98,7 +116,11 @@ class SecureBLE:
                 encrypted = await asyncio.wait_for(self.queue.get(), deadline - time.monotonic())
             except asyncio.TimeoutError:
                 return None
-            packet = bytes(self.crypt.decrypt_data(encrypted))
+            try:
+                packet = bytes(self.crypt.decrypt_data(encrypted))
+            except (ValueError, TypeError) as exc:
+                LOG.warning("Invalid encrypted notification: %s", exc)
+                continue
             if len(packet) < 5 or packet[0] != 1:
                 continue
             if crc16(packet[:-2]) != int.from_bytes(packet[-2:], "little"):
@@ -121,6 +143,7 @@ class SecureBLE:
                 await self.close()
                 raise TimeoutError(f"FC03 {address} timed out")
             if packet[2] != count * 2 or len(packet) != 5 + count * 2:
+                await self.close()
                 raise ValueError(f"Invalid FC03 reply for {address}")
             return struct.unpack(">" + "H" * count, packet[3:-2])
 
