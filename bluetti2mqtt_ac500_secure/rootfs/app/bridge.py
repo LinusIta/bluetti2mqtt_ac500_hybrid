@@ -175,7 +175,7 @@ class Bridge:
                 self.queue.task_done()
 
     async def ble_poll(self):
-        interval = max(10, int(self.cfg.get("poll_sec",120)))
+        interval = int(self.cfg.get("poll_sec",120))
         while True:
             try:
                 raw = {}
