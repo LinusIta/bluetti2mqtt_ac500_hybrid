@@ -71,8 +71,10 @@ class SecureBLE:
         await self.client.write_gatt_char(TX, bytes(encrypted), response=True)
 
     async def connect(self):
-        if (self.authenticated and self.client and self.client.is_connected
-                and time.monotonic() - self.connected_at < 18):
+        # Keep the established encrypted BLE session alive. A forced
+        # re-handshake every 18 seconds caused stale native crypto state and
+        # "invalid decrypt len" after an otherwise successful first poll.
+        if self.authenticated and self.client and self.client.is_connected:
             return
         await self.close()
         # Reinitialize authorized crypto state, including ephemeral AES keys.
