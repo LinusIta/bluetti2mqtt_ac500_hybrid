@@ -1,5 +1,5 @@
 name: "Bluetti2MQTT Plus - AC500 Hybrid Secure (Licensed)"
-version: "0.1.0-beta3"
+version: "0.1.0-beta4"
 stage: experimental
 slug: bluetti2mqtt_ac500_secure
 description: "Licensed AC500: Modbus TCP monitoring and vendor-encrypted BLE control (technical beta)"
