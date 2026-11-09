@@ -183,7 +183,15 @@ class Bridge:
                     if not self.queue.empty():
                         break
                     try:
-                        values = await self.ble.read(start, count)
+                        try:
+                            values = await self.ble.read(start, count)
+                        except TimeoutError as exc:
+                            # SecureBLE closes an expired session on timeout.
+                            # Retry the same read once after ECDH renewal,
+                            # before moving to the next register.
+                            LOG.warning("BLE FC03 %d x%d timeout; retrying once after reconnect: %s",
+                                        start, count, exc)
+                            values = await self.ble.read(start, count)
                         raw.update({start+i: n for i,n in enumerate(values)})
                     except Exception as exc:
                         LOG.warning("BLE FC03 %d x%d failed: %s",start,count,exc)
