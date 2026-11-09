@@ -1,8 +1,8 @@
-name: "Bluetti2MQTT Plus - AC500 Hybrid Secure"
+name: "Bluetti2MQTT Plus - AC500 Hybrid Secure (Licensed)"
 version: "0.1.0-beta1"
 stage: experimental
 slug: bluetti2mqtt_ac500_secure
-description: "AC500 licensed encrypted BLE + Modbus TCP, technical preview"
+description: "Licensed AC500: Modbus TCP monitoring and vendor-encrypted BLE control (technical beta)"
 url: https://github.com/LinusIta/bluetti2mqtt_ac500_hybrid
 arch:
   - amd64
@@ -10,8 +10,6 @@ build: {}
 host_dbus: true
 usb: true
 init: false
-map:
-  - config:rw
 services:
   - mqtt:need
 options:
