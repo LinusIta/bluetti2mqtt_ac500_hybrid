@@ -1,5 +1,5 @@
 name: "Bluetti2MQTT Plus - AC500 Hybrid Secure (Licensed)"
-version: "0.1.0-beta1"
+version: "0.1.0-beta2"
 stage: experimental
 slug: bluetti2mqtt_ac500_secure
 description: "Licensed AC500: Modbus TCP monitoring and vendor-encrypted BLE control (technical beta)"
@@ -10,6 +10,10 @@ build: {}
 host_dbus: true
 usb: true
 init: false
+map:
+  - type: homeassistant_config
+    read_only: true
+    path: /config
 services:
   - mqtt:need
 options:
