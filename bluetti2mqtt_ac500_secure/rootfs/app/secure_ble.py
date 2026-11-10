@@ -71,11 +71,14 @@ class SecureBLE:
         await self.client.write_gatt_char(TX, bytes(encrypted), response=True)
 
     async def connect(self):
-        # Keep the established encrypted BLE session alive. A forced
-        # re-handshake every 18 seconds caused stale native crypto state and
-        # "invalid decrypt len" after an otherwise successful first poll.
+        # AC500 stops answering after about 30 seconds of encrypted traffic.
+        # Renew ECDH before expiry; use a fresh native crypto context and
+        # ignore notifications from the previous BLE connection.
         if self.authenticated and self.client and self.client.is_connected:
-            return
+            age = time.monotonic() - self.connected_at
+            if age < 25:
+                return
+            LOG.info("Renewing encrypted BLE session proactively (age %.1fs)", age)
         await self.close()
         # Reinitialize authorized crypto state, including ephemeral AES keys.
         self.crypt = self.crypt_type()
