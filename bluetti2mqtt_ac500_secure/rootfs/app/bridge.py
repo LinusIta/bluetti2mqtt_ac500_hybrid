@@ -57,6 +57,7 @@ class Bridge:
         self.loop = asyncio.get_running_loop()
         self.queue = asyncio.Queue(maxsize=100)
         self.stop = asyncio.Event()
+        self.power_refresh_requested = asyncio.Event()
         self.values = {}
         self.ble = None
         self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
@@ -169,6 +170,10 @@ class Bridge:
                 confirmed = await self.ble.write_and_verify(
                     address, value, FIELDS[field][1], FIELDS[field][2])
                 self.control_state(address, confirmed)
+                if address == 3019 and self.cfg.get("modbus_host"):
+                    # Wake up the TCP reader immediately after hardware-confirmed
+                    # FC16, rather than waiting for the periodic poll.
+                    self.power_refresh_requested.set()
             except Exception:
                 LOG.exception("Secure command %s rejected or unconfirmed", field)
             finally:
@@ -263,7 +268,22 @@ class Bridge:
                     self.control_state(address,value)
             except Exception as exc:
                 LOG.warning("Modbus TCP poll failed: %s",exc)
-            await asyncio.sleep(interval)
+            # Event-driven update: only the AC input register, independent of
+            # the BLE transport. A second sample covers inverter ramp-up.
+            try:
+                await asyncio.wait_for(self.power_refresh_requested.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+            self.power_refresh_requested.clear()
+            for delay in (0, 1.5):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    watts = (await self.tcp_read(50215, 1))[0]
+                    self.state("ac_input_power", watts)
+                    LOG.info("Post-FC16 Modbus AC input: %d W", watts)
+                except Exception as exc:
+                    LOG.warning("Post-FC16 Modbus AC input read failed: %s", exc)
 
     async def run(self):
         module_dir = Path("/run/bluetti_secure_module")
