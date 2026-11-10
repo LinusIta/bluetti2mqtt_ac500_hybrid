@@ -170,9 +170,11 @@ class Bridge:
                 confirmed = await self.ble.write_and_verify(
                     address, value, FIELDS[field][1], FIELDS[field][2])
                 self.control_state(address, confirmed)
-                if address == 3019 and self.cfg.get("modbus_host"):
-                    # Wake up the TCP reader immediately after hardware-confirmed
-                    # FC16, rather than waiting for the periodic poll.
+                if address in (3015, 3019) and self.cfg.get("modbus_host"):
+                    # Both the minimum SOC threshold (charge start/stop) and
+                    # grid charge current change the real AC input power.
+                    # Refresh only after hardware confirmation; never publish
+                    # the requested setpoint as measured power.
                     self.power_refresh_requested.set()
             except Exception:
                 LOG.exception("Secure command %s rejected or unconfirmed", field)
@@ -268,14 +270,14 @@ class Bridge:
                     self.control_state(address,value)
             except Exception as exc:
                 LOG.warning("Modbus TCP poll failed: %s",exc)
-            # Event-driven update: only the AC input register, independent of
-            # the BLE transport. A second sample covers inverter ramp-up.
+            # Event-driven AC input refresh after confirmed 3015 or 3019.
+            # Additional samples cover the inverter's physical charge ramp.
             try:
                 await asyncio.wait_for(self.power_refresh_requested.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 continue
             self.power_refresh_requested.clear()
-            for delay in (0, 1.5):
+            for delay in (0, 1.5, 3.0):
                 if delay:
                     await asyncio.sleep(delay)
                 try:
