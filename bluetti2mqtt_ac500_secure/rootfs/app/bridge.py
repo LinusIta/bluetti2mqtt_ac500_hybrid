@@ -58,6 +58,7 @@ class Bridge:
         self.queue = asyncio.Queue(maxsize=100)
         self.stop = asyncio.Event()
         self.power_refresh_requested = asyncio.Event()
+        self.tcp_io_lock = asyncio.Lock()
         self.values = {}
         self.ble = None
         self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
@@ -220,31 +221,32 @@ class Bridge:
             await asyncio.sleep(interval)
 
     async def tcp_read(self, address, count):
-        reader,writer = await asyncio.wait_for(
-            asyncio.open_connection(self.cfg["modbus_host"],
-                                    int(self.cfg.get("modbus_port",502))), 4)
-        try:
-            request = struct.pack(">HHHBBHH",1,0,6,1,3,address,count)
-            writer.write(request)
-            await asyncio.wait_for(writer.drain(),4)
-            header = await asyncio.wait_for(reader.readexactly(7),4)
-            tx,proto,length,unit = struct.unpack(">HHHB",header)
-            if (tx,proto,unit) != (1,0,1) or not 3 <= length <= 253:
-                raise ValueError("Invalid TCP MBAP response")
-            pdu = await asyncio.wait_for(reader.readexactly(length-1),4)
-            if pdu[0] != 3 or pdu[1] != count*2 or len(pdu) != 2+count*2:
-                raise ValueError("Invalid TCP Modbus FC03 response")
-            return struct.unpack(">"+"H"*count,pdu[2:])
-        finally:
-            writer.close()
-            await writer.wait_closed()
+        # AC500 allows few Modbus connections; never overlap our own reads.
+        async with self.tcp_io_lock:
+            reader,writer = await asyncio.wait_for(
+                asyncio.open_connection(self.cfg["modbus_host"],
+                                        int(self.cfg.get("modbus_port",502))), 4)
+            try:
+                request = struct.pack(">HHHBBHH",1,0,6,1,3,address,count)
+                writer.write(request)
+                await asyncio.wait_for(writer.drain(),4)
+                header = await asyncio.wait_for(reader.readexactly(7),4)
+                tx,proto,length,unit = struct.unpack(">HHHB",header)
+                if (tx,proto,unit) != (1,0,1) or not 3 <= length <= 253:
+                    raise ValueError("Invalid TCP MBAP response")
+                pdu = await asyncio.wait_for(reader.readexactly(length-1),4)
+                if pdu[0] != 3 or pdu[1] != count*2 or len(pdu) != 2+count*2:
+                    raise ValueError("Invalid TCP Modbus FC03 response")
+                return struct.unpack(">"+"H"*count,pdu[2:])
+            finally:
+                writer.close()
+                await writer.wait_closed()
 
     async def tcp_poll(self):
         interval = max(2,int(self.cfg.get("modbus_poll_sec",5)))
         while True:
             try:
-                freq,grid = await self.tcp_read(50214,2)
-                ac = (await self.tcp_read(50217,1))[0]
+                freq = (await self.tcp_read(50214,1))[0]
                 pv = (await self.tcp_read(50004,1))[0]
                 battery = await self.tcp_read(51002,3)
                 pv1 = await self.tcp_read(50269,2)
@@ -255,8 +257,7 @@ class Bridge:
                 if not (0 <= battery[2] <= 100 and 250 <= battery[0] <= 700
                         and 0 <= soc[0] <= soc[1] <= 100):
                     raise ValueError("Implausible Modbus readings")
-                states = {"ac_output_power":ac, "ac_input_power":grid,
-                          "dc_input_power":pv, "total_battery_percent":battery[2],
+                states = {"dc_input_power":pv, "total_battery_percent":battery[2],
                           "battery_soc":battery[2], "total_battery_voltage":battery[0]/10,
                           "total_battery_current":battery[1]/10,
                           "dc_input_power1":pv1[0], "dc_input_voltage1":pv1[1]/10,
@@ -270,22 +271,31 @@ class Bridge:
                     self.control_state(address,value)
             except Exception as exc:
                 LOG.warning("Modbus TCP poll failed: %s",exc)
-            # Event-driven AC input refresh after confirmed 3015 or 3019.
-            # Additional samples cover the inverter's physical charge ramp.
-            try:
-                await asyncio.wait_for(self.power_refresh_requested.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                continue
+            await asyncio.sleep(interval)
+
+    async def tcp_power_poll(self):
+        # Dedicated, BLE-independent fast polling. Both power sensors are
+        # real AC500 readings; no values are inferred from charging settings.
+        interval = 2.0
+        while True:
             self.power_refresh_requested.clear()
-            for delay in (0, 1.5, 3.0):
-                if delay:
-                    await asyncio.sleep(delay)
-                try:
-                    watts = (await self.tcp_read(50215, 1))[0]
-                    self.state("ac_input_power", watts)
-                    LOG.info("Post-FC16 Modbus AC input: %d W", watts)
-                except Exception as exc:
-                    LOG.warning("Post-FC16 Modbus AC input read failed: %s", exc)
+            try:
+                ac_input = (await self.tcp_read(50215, 1))[0]
+                ac_output = (await self.tcp_read(50217, 1))[0]
+                self.state("ac_input_power", ac_input)
+                self.state("ac_output_power", ac_output)
+                if self.cfg.get("debug"):
+                    LOG.debug("Fast Modbus AC input=%d W, output=%d W",
+                              ac_input, ac_output)
+            except Exception as exc:
+                LOG.warning("Fast Modbus power poll failed: %s", exc)
+            # A confirmed FC16 wakes the next reading immediately; otherwise
+            # sample both powers every 2 s plus network read duration.
+            try:
+                await asyncio.wait_for(self.power_refresh_requested.wait(),
+                                       timeout=interval)
+            except asyncio.TimeoutError:
+                pass
 
     async def run(self):
         module_dir = Path("/run/bluetti_secure_module")
@@ -301,6 +311,7 @@ class Bridge:
         jobs = [asyncio.create_task(self.writer()),asyncio.create_task(self.ble_poll())]
         if self.cfg.get("modbus_host"):
             jobs.append(asyncio.create_task(self.tcp_poll()))
+            jobs.append(asyncio.create_task(self.tcp_power_poll()))
         try:
             await self.stop.wait()
         finally:
