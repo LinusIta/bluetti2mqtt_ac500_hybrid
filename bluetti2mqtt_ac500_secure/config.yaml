@@ -1,0 +1,52 @@
+name: "Bluetti2MQTT Plus - AC500 Hybrid Secure (Licensed)"
+version: "0.1.0-beta11"
+stage: experimental
+slug: bluetti2mqtt_ac500_secure
+description: "Licensed AC500: Modbus TCP monitoring and vendor-encrypted BLE control (technical beta)"
+url: https://github.com/LinusIta/bluetti2mqtt_ac500_hybrid
+arch:
+  - amd64
+build: {}
+host_dbus: true
+usb: true
+init: false
+map:
+  - type: homeassistant_config
+    read_only: true
+    path: /config
+services:
+  - mqtt:need
+options:
+  bt_mac: "00:11:22:33:44:55"
+  device_serial: "0000000000000"
+  modbus_host: ""
+  modbus_port: 502
+  modbus_poll_sec: 5
+  mqtt_host: ""
+  mqtt_port: ""
+  mqtt_username: ""
+  mqtt_password: ""
+  poll_sec: 120
+  pack_poll_sec: 600
+  pack_scan_sec: 3600
+  pack_poll_enabled: false
+  ha_config: normal
+  allow_writes: false
+  debug: false
+schema:
+  bt_mac: str
+  device_serial: str
+  mqtt_host: str
+  mqtt_port: str
+  mqtt_username: str?
+  mqtt_password: password?
+  modbus_host: str
+  modbus_port: int
+  modbus_poll_sec: int
+  poll_sec: int
+  pack_poll_sec: int
+  pack_scan_sec: int
+  pack_poll_enabled: bool
+  ha_config: list(normal|none|advanced)
+  allow_writes: bool
+  debug: bool
