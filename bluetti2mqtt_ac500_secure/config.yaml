@@ -1,5 +1,5 @@
 name: "Bluetti2MQTT Plus - AC500 Hybrid Secure (Licensed)"
-version: "0.1.0-beta12"
+version: "0.1.0-beta13"
 stage: experimental
 slug: bluetti2mqtt_ac500_secure
 description: "Licensed AC500: Modbus TCP monitoring and vendor-encrypted BLE control (technical beta)"
@@ -32,6 +32,8 @@ options:
   pack_poll_enabled: false
   ha_config: normal
   allow_writes: false
+  allow_bluetooth_reset: false
+  bluetooth_adapter: "hci0"
   debug: false
 schema:
   bt_mac: str
@@ -49,4 +51,6 @@ schema:
   pack_poll_enabled: bool
   ha_config: list(normal|none|advanced)
   allow_writes: bool
+  allow_bluetooth_reset: bool
+  bluetooth_adapter: str
   debug: bool
