@@ -268,14 +268,19 @@ class Bridge:
                 confirmed = await self.ble.write_and_verify(
                     address, value, FIELDS[field][1], FIELDS[field][2])
                 self.control_state(address, confirmed)
+                self.ble_success()
                 if address in (3015, 3019) and self.cfg.get("modbus_host"):
                     # Both the minimum SOC threshold (charge start/stop) and
                     # grid charge current change the real AC input power.
                     # Refresh only after hardware confirmation; never publish
                     # the requested setpoint as measured power.
                     self.power_refresh_requested.set()
-            except Exception:
+            except Exception as exc:
                 LOG.exception("Secure command %s rejected or unconfirmed", field)
+                # A failed BLE connect/read is a link outage, whereas a
+                # device-rejected FC16 value is not necessarily one.
+                if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+                    self.ble_failure()
             finally:
                 self.writer_busy = False
                 self.queue.task_done()
