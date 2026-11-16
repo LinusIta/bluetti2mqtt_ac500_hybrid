@@ -1,0 +1,104 @@
+# Home Assistant package for AC500 Hybrid Secure beta13.
+# Requires a working Telegram bot, MQTT, and the HA packages include.
+# Add to secrets.yaml:
+#   telegram_ac500_chat_id: <your authorized chat ID>
+#   telegram_ac500_user_id: <your own Telegram user ID>
+#
+# Set allow_bluetooth_reset: true in the Secure add-on.
+# This will reset the entire Bluetooth adapter only after a button press.
+
+automation:
+  - id: ac500_secure_ble_recovery_prompt
+    alias: "AC500 Secure - Telegram BLE recovery prompt"
+    mode: queued
+    triggers:
+      - trigger: mqtt
+        topic: "bluetti/event/AC500-2310000587478/ble_recovery"
+        payload: reset_available
+        value_template: "{{ value_json.event }}"
+    actions:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.payload_json.reset_allowed | default(false) }}"
+            sequence:
+              - action: telegram_bot.send_message
+                data:
+                  chat_id: !secret telegram_ac500_chat_id
+                  message: >-
+                    ⚠️ AC500: collegamento Bluetooth cifrato non disponibile
+                    dopo {{ trigger.payload_json.failures }} tentativi.
+                    La telemetria Modbus continua a funzionare.
+                    Vuoi resettare l'adattatore Bluetooth di Home Assistant?
+                    Il reset interromperà temporaneamente anche gli altri dispositivi Bluetooth.
+                  inline_keyboard:
+                    - "🔄 Ripristina Bluetooth:/ac500_ble_reset_{{ trigger.payload_json.token }}"
+        default:
+          - action: telegram_bot.send_message
+            data:
+              chat_id: !secret telegram_ac500_chat_id
+              message: >-
+                ⚠️ AC500: Bluetooth non disponibile.
+                Reset da Telegram disabilitato nelle opzioni dell'add-on
+                (allow_bluetooth_reset: false).
+
+  - id: ac500_secure_ble_recovery_callback
+    alias: "AC500 Secure - Telegram authorized Bluetooth reset"
+    mode: single
+    triggers:
+      - trigger: event
+        event_type: telegram_callback
+    variables:
+      authorized_chat: !secret telegram_ac500_chat_id
+      authorized_user: !secret telegram_ac500_user_id
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.data | default('')) | regex_match('^/ac500_ble_reset_[0-9a-f]{24}$')
+             and trigger.event.data.chat_id | int(0) == authorized_chat | int(0)
+             and trigger.event.data.user_id | int(0) == authorized_user | int(0) }}
+    actions:
+      - action: telegram_bot.answer_callback_query
+        data:
+          callback_query_id: "{{ trigger.event.data.id }}"
+          message: "Richiesta inoltrata alla Secure; attendi il risultato."
+          show_alert: false
+      - action: mqtt.publish
+        data:
+          topic: "bluetti/maintenance/AC500-2310000587478/reset_bluetooth"
+          payload: "{{ trigger.event.data.data[17:] }}"
+          qos: 1
+          retain: false
+
+  - id: ac500_secure_ble_recovery_status
+    alias: "AC500 Secure - Telegram Bluetooth recovery status"
+    mode: queued
+    triggers:
+      - trigger: mqtt
+        topic: "bluetti/event/AC500-2310000587478/ble_recovery"
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.payload_json.event | default('') in
+             ['reset_started', 'reset_completed', 'reset_failed',
+              'reset_denied', 'recovered'] }}
+    actions:
+      - action: telegram_bot.send_message
+        data:
+          chat_id: !secret telegram_ac500_chat_id
+          message: >-
+            {% set e = trigger.payload_json.event %}
+            {% if e == 'reset_started' %}
+              🔄 AC500: reset adattatore Bluetooth avviato su tua richiesta.
+            {% elif e == 'reset_completed' %}
+              ✅ AC500: adattatore Bluetooth riacceso.
+              Attendo la verifica della connessione BLE cifrata.
+            {% elif e == 'recovered' %}
+              ✅ AC500: comunicazione Bluetooth cifrata nuovamente operativa.
+            {% elif e == 'reset_denied' %}
+              ⚠️ AC500: reset non eseguito ({{ trigger.payload_json.reason | default('richiesta non valida') }}).
+            {% else %}
+              ❌ AC500: reset adattatore non riuscito
+              ({{ trigger.payload_json.reason | default('errore sconosciuto') }}).
+              Verifica i log della Hybrid Secure.
+            {% endif %}
