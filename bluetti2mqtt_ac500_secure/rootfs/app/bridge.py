@@ -71,6 +71,8 @@ class Bridge:
         self.recovery_issued = 0.0
         self.recovery_last_reset = 0.0
         self.recovery_resetting = False
+        self.recovery_open = False
+        self.writer_busy = False
         self.values = {}
         self.ble = None
         self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
@@ -96,6 +98,7 @@ class Bridge:
         if now - self.recovery_last_reset < 600:
             return
         self.recovery_token = secrets.token_hex(12)
+        self.recovery_open = True
         self.recovery_issued = now
         self.recovery_event(
             "reset_available", token=self.recovery_token,
@@ -107,7 +110,8 @@ class Bridge:
 
     def ble_success(self):
         self.ble_failures = 0
-        if self.recovery_token:
+        if self.recovery_open:
+            self.recovery_open = False
             self.recovery_token = None
             self.recovery_issued = 0.0
             self.recovery_event("recovered")
@@ -126,7 +130,7 @@ class Bridge:
             LOG.warning("Bluetooth reset request denied: stale/invalid token or cooldown")
             self.recovery_event("reset_denied", reason="expired_or_cooldown")
             return
-        if not self.queue.empty():
+        if self.writer_busy or not self.queue.empty():
             LOG.warning("Bluetooth reset deferred: pending BLE write")
             self.recovery_event("reset_denied", reason="pending_write")
             return
@@ -257,6 +261,7 @@ class Bridge:
     async def writer(self):
         while True:
             field, payload = await self.queue.get()
+            self.writer_busy = True
             try:
                 address, value = self.parse(field,payload)
                 LOG.info("FC16 %s -> %s", field, value)
@@ -272,6 +277,7 @@ class Bridge:
             except Exception:
                 LOG.exception("Secure command %s rejected or unconfirmed", field)
             finally:
+                self.writer_busy = False
                 self.queue.task_done()
 
     async def ble_poll(self):
