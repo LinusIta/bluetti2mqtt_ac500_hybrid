@@ -183,42 +183,55 @@ class Bridge:
                 self.queue.task_done()
 
     async def ble_poll(self):
-        interval = int(self.cfg.get("poll_sec",120))
+        interval = max(1, int(self.cfg.get("poll_sec", 120)))
+        failures = 0
         while True:
+            raw = {}
+            unavailable = False
             try:
-                raw = {}
                 for start, count in BLE_READS:
+                    # Give pending writes priority; they use the same BLE link.
                     if not self.queue.empty():
                         break
                     try:
-                        try:
-                            values = await self.ble.read(start, count)
-                        except TimeoutError as exc:
-                            # SecureBLE closes an expired session on timeout.
-                            # Retry the same read once after ECDH renewal,
-                            # before moving to the next register.
-                            LOG.warning("BLE FC03 %d x%d timeout; retrying once after reconnect: %s",
-                                        start, count, exc)
-                            values = await self.ble.read(start, count)
-                        raw.update({start+i: n for i,n in enumerate(values)})
+                        values = await self.ble.read(start, count)
+                        raw.update({start+i: n for i, n in enumerate(values)})
                     except Exception as exc:
-                        LOG.warning("BLE FC03 %d x%d failed: %s",start,count,exc)
-                for name,(addr,places) in LEGACY.items():
-                    if addr in raw and not (name=="total_battery_voltage" and self.cfg.get("modbus_host")):
+                        # A connection/handshake/read failure typically affects
+                        # the entire encrypted session, not just this register.
+                        # Do not attempt all remaining registers against a
+                        # disconnected AC500 (each attempt may take 25 s).
+                        LOG.warning("BLE unavailable at FC03 %d x%d (%s: %s)",
+                                    start, count, type(exc).__name__, exc)
+                        unavailable = True
+                        break
+                for name, (addr, places) in LEGACY.items():
+                    if addr in raw and not (name == "total_battery_voltage"
+                                           and self.cfg.get("modbus_host")):
                         self.state(name, raw[addr] / (10**places) if places else raw[addr])
                 if 43 in raw and not self.cfg.get("modbus_host"):
-                    self.state("total_battery_percent",raw[43])
-                    self.state("battery_soc",raw[43])
+                    self.state("total_battery_percent", raw[43])
+                    self.state("battery_soc", raw[43])
                 if 170 in raw and 172 in raw:
-                    self.state("dc_input_voltage2",raw[170]/10)
-                    self.state("dc_input_power2",raw[172])
-                for address in sorted({a for a,_,_ in FIELDS.values()}):
+                    self.state("dc_input_voltage2", raw[170] / 10)
+                    self.state("dc_input_power2", raw[172])
+                for address in sorted({a for a, _, _ in FIELDS.values()}):
                     if address in raw:
-                        self.control_state(address,raw[address])
-                LOG.info("BLE poll completed (%d registers)",len(raw))
+                        self.control_state(address, raw[address])
+                if raw:
+                    LOG.info("BLE poll completed (%d registers)", len(raw))
             except Exception:
                 LOG.exception("BLE poll error")
-            await asyncio.sleep(interval)
+                unavailable = True
+            if unavailable:
+                failures += 1
+                delay = min(120, 15 * (2 ** min(failures - 1, 3)))
+                LOG.warning("BLE poll recovery pause: %d s (failure %d); "
+                            "Modbus TCP remains active", delay, failures)
+                await asyncio.sleep(delay)
+            else:
+                failures = 0
+                await asyncio.sleep(interval)
 
     async def tcp_read(self, address, count):
         # AC500 allows few Modbus connections; never overlap our own reads.
