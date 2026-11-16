@@ -4,13 +4,16 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
+import time
 import struct
 import sys
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
 from patch_module import prepare
+from bluetooth_recovery import reset_adapter
 
 LOG = logging.getLogger("ac500_secure")
 
@@ -54,11 +57,20 @@ class Bridge:
         self.serial = str(cfg["device_serial"])
         self.prefix = f"bluetti/state/AC500-{self.serial}/"
         self.command_prefix = f"bluetti/command/AC500-{self.serial}/"
+        self.recovery_topic = f"bluetti/event/AC500-{self.serial}/ble_recovery"
+        self.reset_command_topic = (
+            f"bluetti/maintenance/AC500-{self.serial}/reset_bluetooth"
+        )
         self.loop = asyncio.get_running_loop()
         self.queue = asyncio.Queue(maxsize=100)
         self.stop = asyncio.Event()
         self.power_refresh_requested = asyncio.Event()
         self.tcp_io_lock = asyncio.Lock()
+        self.ble_failures = 0
+        self.recovery_token = None
+        self.recovery_issued = 0.0
+        self.recovery_last_reset = 0.0
+        self.recovery_resetting = False
         self.values = {}
         self.ble = None
         self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
@@ -68,6 +80,71 @@ class Bridge:
         self.mqtt.on_connect = self.on_connect
         self.mqtt.on_message = self.on_message
 
+    def recovery_event(self, event, **details):
+        payload = {"event": event, **details}
+        self.mqtt.publish(self.recovery_topic, json.dumps(payload),
+                          qos=1, retain=False)
+
+    def ble_failure(self):
+        self.ble_failures += 1
+        now = time.monotonic()
+        if self.ble_failures < 3 or self.recovery_resetting:
+            return
+        # One alert per incident; renew an unused token only after expiry.
+        if self.recovery_token and now - self.recovery_issued < 900:
+            return
+        if now - self.recovery_last_reset < 600:
+            return
+        self.recovery_token = secrets.token_hex(12)
+        self.recovery_issued = now
+        self.recovery_event(
+            "reset_available", token=self.recovery_token,
+            failures=self.ble_failures,
+            reset_allowed=self.cfg.get("allow_bluetooth_reset") is True,
+        )
+        LOG.error("BLE unavailable after %d failed polls; "
+                  "recovery authorization requested", self.ble_failures)
+
+    def ble_success(self):
+        self.ble_failures = 0
+        if self.recovery_token:
+            self.recovery_token = None
+            self.recovery_issued = 0.0
+            self.recovery_event("recovered")
+            LOG.info("BLE connection restored; recovery request invalidated")
+
+    async def requested_adapter_reset(self, token):
+        now = time.monotonic()
+        if self.cfg.get("allow_bluetooth_reset") is not True:
+            LOG.warning("Bluetooth reset denied: add-on option disabled")
+            self.recovery_event("reset_denied", reason="disabled")
+            return
+        if (self.recovery_resetting or self.recovery_token is None
+                or not secrets.compare_digest(token, self.recovery_token)
+                or now - self.recovery_issued > 900
+                or now - self.recovery_last_reset < 600):
+            LOG.warning("Bluetooth reset request denied: stale/invalid token or cooldown")
+            self.recovery_event("reset_denied", reason="expired_or_cooldown")
+            return
+        if not self.queue.empty():
+            LOG.warning("Bluetooth reset deferred: pending BLE write")
+            self.recovery_event("reset_denied", reason="pending_write")
+            return
+        self.recovery_resetting = True
+        self.recovery_token = None  # Consume before any await; one-shot.
+        self.recovery_last_reset = now
+        self.recovery_event("reset_started")
+        try:
+            await reset_adapter(self.cfg.get("bluetooth_adapter", "hci0"), self.ble)
+            self.recovery_event("reset_completed")
+            LOG.info("User-approved Bluetooth adapter power cycle completed; "
+                     "waiting for successful BLE poll")
+        except Exception as exc:
+            LOG.exception("User-approved Bluetooth adapter reset failed")
+            self.recovery_event("reset_failed", reason=type(exc).__name__)
+        finally:
+            self.recovery_resetting = False
+
     def state(self, field, value):
         self.mqtt.publish(self.prefix + field, str(value), qos=1, retain=True)
 
@@ -76,10 +153,25 @@ class Bridge:
             LOG.error("MQTT connection error: %s", code)
             return
         client.subscribe(self.command_prefix + "+", qos=1)
+        client.subscribe(self.reset_command_topic, qos=1)
         self.loop.call_soon_threadsafe(self.discovery)
 
     def on_message(self, _client, _userdata, message):
-        if message.retain or not message.topic.startswith(self.command_prefix):
+        if message.retain:
+            return
+        if message.topic == self.reset_command_topic:
+            try:
+                token = message.payload.decode("ascii")
+            except UnicodeDecodeError:
+                return
+            if not re.fullmatch(r"[a-f0-9]{24}", token):
+                LOG.warning("Invalid BLE reset token format")
+                return
+            self.loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self.requested_adapter_reset(token))
+            )
+            return
+        if not message.topic.startswith(self.command_prefix):
             return
         field = message.topic[len(self.command_prefix):]
         if field not in FIELDS:
@@ -225,12 +317,16 @@ class Bridge:
                 unavailable = True
             if unavailable:
                 failures += 1
+                self.ble_failure()
                 delay = min(120, 15 * (2 ** min(failures - 1, 3)))
                 LOG.warning("BLE poll recovery pause: %d s (failure %d); "
                             "Modbus TCP remains active", delay, failures)
                 await asyncio.sleep(delay)
             else:
                 failures = 0
+                # Only a full, nonempty read proves the BLE link recovered.
+                if len(raw) >= 20:
+                    self.ble_success()
                 await asyncio.sleep(interval)
 
     async def tcp_read(self, address, count):
